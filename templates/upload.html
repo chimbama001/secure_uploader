@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Upload</title></head>
+  <body>
+    <h1>Upload a file (will be encrypted)</h1>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul>
+        {% for m in messages %}<li>{{ m }}</li>{% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+    <form method="post" enctype="multipart/form-data">
+      <input type="file" name="file" required>
+      <button type="submit">Upload & Encrypt</button>
+    </form>
+    <p><a href="{{ url_for('index') }}">Home</a> | <a href="{{ url_for('files') }}">Files</a></p>
+  </body>
+</html>
+

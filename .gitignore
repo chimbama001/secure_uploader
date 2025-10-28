@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+venv/
+
+# Local environment variables
+.env
+.env.*
+
+# Encrypted uploaded files
+uploads/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# SQLite DB (optional - if you don’t want to share stored file history)
+files.db
+
+.venv/
+uploads/
+.env
+.env.*
+__pycache__/
+*.pyc
+files.db
