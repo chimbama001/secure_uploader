@@ -4,17 +4,30 @@ import sqlite3
 import datetime
 import io
 import base64
+import enum
 from dotenv import load_dotenv
 load_dotenv()
-from flask import Flask, request, redirect, url_for, render_template, send_file, abort, flash
+from flask import Flask, request, redirect, url_for, render_template, send_file, abort, flash, jsonify
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
+
+# User role enum
+class UserRole(enum.Enum):
+    USER = "user"
+    ADMIN = "admin"
+
+# In-memory user storage
+USERS = {}
 
 # Configuration
 UPLOAD_FOLDER = "uploads"
 DB_PATH = "files.db"
 ALLOWED_EXTENSIONS = None  # allow all
 MAX_CONTENT_LENGTH = 200 * 1024 * 1024  # 200 MB limit (adjustable)
+
+# In-memory storage for temporary files
+TEMP_FILES = {}
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -23,9 +36,9 @@ app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24))
 
 # Load encryption key from environment
 ENC_KEY_B64 = os.environ.get("UPLOAD_ENC_KEY")
-if not ENC_KEY_B64:
-    raise RuntimeError("Set the UPLOAD_ENC_KEY env variable (base64-encoded 32 bytes).")
-ENCKEY = load_key_from_env(ENC_KEY_B64)
+# if not ENC_KEY_B64:
+#     raise RuntimeError("Set the UPLOAD_ENC_KEY env variable (base64-encoded 32 bytes).")
+# ENCKEY = load_key_from_env(ENC_KEY_B64)
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -101,7 +114,8 @@ def guess_mime(filename, filebytes):
 # Routes
 @app.route('/')
 def index():
-    return render_template('index.html')
+    roles = [role.value for role in UserRole]  # Pass roles to template
+    return render_template('index.html', roles=roles)
 
 @app.route('/upload', methods=['GET','POST'])
 def upload():
@@ -178,6 +192,127 @@ def delete(file_id):
     else:
         flash("File deleted.")
     return redirect(url_for('files'))
+
+@app.route('/temp-upload', methods=['POST'])
+def temp_upload():
+    if 'file' not in request.files:
+        return {'error': 'No file part'}, 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return {'error': 'No selected file'}, 400
+
+    filename = secure_filename(file.filename)
+    file_content = file.read()
+    
+    # Generate a unique identifier for the file
+    import uuid
+    file_id = str(uuid.uuid4())
+    
+    # Store file in memory
+    TEMP_FILES[file_id] = {
+        'filename': filename,
+        'content': file_content,
+        'mime': guess_mime(filename, file_content),
+        'timestamp': datetime.datetime.utcnow().isoformat()
+    }
+    
+    return {
+        'file_id': file_id,
+        'filename': filename,
+        'size': len(file_content),
+        'mime': TEMP_FILES[file_id]['mime']
+    }
+
+@app.route('/temp-file/<file_id>')
+def get_temp_file(file_id):
+    if file_id not in TEMP_FILES:
+        return {'error': 'File not found'}, 404
+    
+    file_data = TEMP_FILES[file_id]
+    return send_file(
+        io.BytesIO(file_data['content']),
+        download_name=file_data['filename'],
+        mimetype=file_data['mime']
+    )
+
+@app.route('/temp-file/<file_id>', methods=['DELETE'])
+def delete_temp_file(file_id):
+    if file_id not in TEMP_FILES:
+        return {'error': 'File not found'}, 404
+    
+    del TEMP_FILES[file_id]
+    return {'message': 'File deleted successfully'}
+
+@app.route('/add-user')
+def add_user_form():
+    roles = [role.value for role in UserRole]
+    return render_template('add_user.html', roles=roles)
+
+@app.route('/users', methods=['GET', 'POST'])
+def users():
+    if request.method == 'POST':
+        # Get user data from request
+        data = request.json
+        if not data:
+            return {'error': 'No data provided'}, 400
+        
+        username = data.get('username')
+        password = data.get('password')
+        role = data.get('role', 'user')  # Default to user role if not specified
+        
+        # Validate required fields
+        if not username or not password:
+            return {'error': 'Username and password are required'}, 400
+            
+        # Check if username already exists
+        if username in USERS:
+            return {'error': 'Username already exists'}, 400
+            
+        # Validate role
+        try:
+            user_role = UserRole(role.lower())
+        except ValueError:
+            return {'error': 'Invalid role. Must be either "user" or "admin"'}, 400
+        
+        # Create user object
+        user = {
+            'username': username,
+            'password_hash': generate_password_hash(password),
+            'role': user_role.value,
+            'created_at': datetime.datetime.utcnow().isoformat()
+        }
+        
+        # Store user in memory
+        USERS[username] = user
+        
+        # Return success response (without password hash)
+        response_user = user.copy()
+        del response_user['password_hash']
+        return jsonify(response_user), 201
+        
+    # GET method - return list of users
+    return jsonify({
+        'users': [
+            {
+                'username': username,
+                'role': user_data['role'],
+                'created_at': user_data['created_at']
+            }
+            for username, user_data in USERS.items()
+        ]
+    })
+
+@app.route('/users/<username>', methods=['GET'])
+def get_user(username):
+    user = USERS.get(username)
+    if not user:
+        return {'error': 'User not found'}, 404
+        
+    # Return user info without password hash
+    response_user = user.copy()
+    del response_user['password_hash']
+    return jsonify(response_user)
 
 if __name__ == '__main__':
     init_db()
