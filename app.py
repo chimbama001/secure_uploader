@@ -11,6 +11,11 @@ from flask import Flask, request, redirect, url_for, render_template, send_file,
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
+from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
+ENC_KEY = load_key_from_env()
+ENCKEY = ENC_KEY  # alias so any old code using ENCKEY still works
+from sharing_demo import demo          # add near other imports
+
 
 # User role enum
 class UserRole(enum.Enum):
@@ -30,6 +35,7 @@ MAX_CONTENT_LENGTH = 200 * 1024 * 1024  # 200 MB limit (adjustable)
 TEMP_FILES = {}
 
 app = Flask(__name__)
+app.register_blueprint(demo)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24))

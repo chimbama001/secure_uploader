@@ -10,6 +10,7 @@
         </ul>
       {% endif %}
     {% endwith %}
+    <p><a href="{{ url_for('demo.shared_with_me') }}">Shared With Me</a></p>
     <p><a href="{{ url_for('upload') }}">Upload new</a> | <a href="{{ url_for('index') }}">Home</a></p>
     {% if files %}
       <table border="1" cellpadding="6">
@@ -28,6 +29,7 @@
             <a href="{{ url_for('download', file_id=f[0]) }}">Download</a> |
             <form style="display:inline" method="post" action="{{ url_for('delete', file_id=f[0]) }}" onsubmit="return confirm('Delete file?');">
               <button type="submit">Delete</button>
+              | <a href="{{ url_for('demo.share', file_id=f[0]) }}">Share</a>
             </form>
           </td>
         </tr>

@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <body>
+    <h2>Shared With Me</h2>
+    <p><a href="{{ url_for('demo.home') }}">Back</a></p>
+    {% if shares %}
+      <table border="1" cellpadding="6">
+        <tr><th>File ID</th><th>Name</th><th>From</th><th>Expires</th><th>Action</th></tr>
+        {% for s in shares %}
+          <tr>
+            <td>{{ s[1] }}</td>
+            <td>{{ s[2] }}</td>
+            <td>{{ s[4] }}</td>
+            <td>{{ s[5] }}</td>
+            <td><a href="{{ url_for('demo.download', file_id=s[1]) }}">Download</a></td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% else %}
+      <p>Nothing shared to you yet.</p>
+    {% endif %}
+  </body>
+</html>

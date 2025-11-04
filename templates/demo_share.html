@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+  <body>
+    <h2>Share: {{ file[1] }} (ID {{ file[0] }})</h2>
+    <form method="post">
+      <label>Recipient email</label>
+      <input name="to_email" type="email" required>
+      <label>Expires (days)</label>
+      <input name="days" type="number" min="1" value="7">
+      <button type="submit">Share</button>
+    </form>
+    <p><a href="{{ url_for('demo.home') }}">Back</a></p>
+  </body>
+</html>

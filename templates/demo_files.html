@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+  <body>
+    <h2>Demo: Files</h2>
+    <p>
+      {% if me %}
+        Logged in as {{ me }} |
+        <a href="{{ url_for('demo.shared_with_me') }}">Shared With Me</a> |
+        <a href="{{ url_for('demo.logout') }}">Logout</a>
+      {% else %}
+        <a href="{{ url_for('demo.login') }}">Login</a>
+      {% endif %}
+    </p>
+
+    {% if files %}
+      <table border="1" cellpadding="6">
+        <tr><th>ID</th><th>Name</th><th>Size</th><th>Uploaded</th><th>Action</th></tr>
+        {% for f in files %}
+          <tr>
+            <td>{{ f[0] }}</td>
+            <td>{{ f[1] }}</td>
+            <td>{{ f[2] }}</td>
+            <td>{{ f[3] }}</td>
+            <td><a href="{{ url_for('demo.share', file_id=f[0]) }}">Share</a></td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% else %}
+      <p>No files yet. Use your app’s Upload, then refresh.</p>
+    {% endif %}
+  </body>
+</html>
