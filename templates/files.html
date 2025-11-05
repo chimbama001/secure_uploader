@@ -10,7 +10,13 @@
         </ul>
       {% endif %}
     {% endwith %}
-    <p><a href="{{ url_for('upload') }}">Upload new</a> | <a href="{{ url_for('index') }}">Home</a></p>
+    <p>
+      <a href="{{ url_for('upload') }}">Upload new</a> | <a href="{{ url_for('index') }}">Home</a>
+      {% if current_user %}
+        | Logged in as: <strong>{{ current_user.username }}</strong>
+        | <a href="{{ url_for('logout') }}">Logout</a>
+      {% endif %}
+    </p>
     {% if files %}
       <table border="1" cellpadding="6">
         <tr><th>ID</th><th>Original Name</th><th>Mime</th><th>Size (bytes)</th><th>Uploaded</th><th>Actions</th></tr>
@@ -29,6 +35,13 @@
             <form style="display:inline" method="post" action="{{ url_for('delete', file_id=f[0]) }}" onsubmit="return confirm('Delete file?');">
               <button type="submit">Delete</button>
             </form>
+            {% if current_user and (current_user.id == f[6] or current_user.role == 'admin') %}
+              <!-- Share form for owners/admin -->
+              <form style="display:inline" method="post" action="{{ url_for('share', file_id=f[0]) }}">
+                <input name="username" placeholder="share with user" />
+                <button type="submit">Share</button>
+              </form>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}

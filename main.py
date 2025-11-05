@@ -11,12 +11,17 @@ from io import BytesIO
 from dotenv import load_dotenv
 load_dotenv()
 
+from functools import wraps
 from flask import (
     Flask, request, redirect, url_for, render_template, render_template_string,
-    send_file, abort, flash, jsonify
+    send_file, abort, flash, jsonify, session, g
 )
 from werkzeug.utils import secure_filename
-from werkzeug.security import generate_password_hash
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import re  # for password complexity
 from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
 
 # =========================================
@@ -25,16 +30,68 @@ from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24))
 
+# Security: ensure session cookie flags are set for production
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
+# Password hasher (Argon2)
+ph = PasswordHasher()
+
+# Rate limiter
+limiter = Limiter(app, key_func=get_remote_address)
+
 # ------------------ user roles ------------------
 class UserRole(enum.Enum):
     USER = "user"
     ADMIN = "admin"
 
-USERS = {}
+PASSWORD_REGEX = re.compile(
+    r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#^])[A-Za-z\d@$!%*?&#^]{12,}$'
+)
+
+def validate_password_complexity(pw: str) -> bool:
+    """At least 12 chars, upper, lower, number, special."""
+    return bool(PASSWORD_REGEX.match(pw))
+
+
+# --- auth helpers ---
+def login_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if 'user_id' not in session:
+            flash("Please log in first.")
+            return redirect(url_for('login'))
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+@app.before_request
+def load_logged_in_user():
+    user_id = session.get('user_id')
+    g.user = None
+    if user_id is not None:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT id, username, role FROM users WHERE id=?', (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            g.user = {'id': row[0], 'username': row[1], 'role': row[2]}
 
 # ------------------ config ------------------
-UPLOAD_FOLDER = "uploads"
-DB_PATH = "files.db"
+# Allow pointing to a persistent data directory via DATA_DIR so uploads and DB
+# can live outside the repo (useful for sharing between runs or teammates).
+DATA_DIR = os.environ.get('DATA_DIR')  # e.g. /srv/secure_uploader_data
+if DATA_DIR:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
+    DB_PATH = os.path.join(DATA_DIR, 'files.db')
+else:
+    UPLOAD_FOLDER = "uploads"
+    DB_PATH = "files.db"
 ALLOWED_EXTENSIONS = None
 MAX_CONTENT_LENGTH = 200 * 1024 * 1024
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -43,11 +100,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # ------------------ encryption (original app.py) ------------------
 ENC_KEY_B64 = os.environ.get("UPLOAD_ENC_KEY")
-# uncomment in real run:
-# if not ENC_KEY_B64:
-#     raise RuntimeError("Set UPLOAD_ENC_KEY")
-# ENCKEY = load_key_from_env(ENC_KEY_B64)
-ENCKEY = load_key_from_env(ENC_KEY_B64) if ENC_KEY_B64 else None
+if not ENC_KEY_B64:
+    raise RuntimeError("UPLOAD_ENC_KEY must be set (base64 of 32 bytes).")
+ENCKEY = load_key_from_env(ENC_KEY_B64)
 
 # ------------------ temp files (original app.py) ------------------
 TEMP_FILES = {}
@@ -58,6 +113,19 @@ TEMP_FILES = {}
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Users
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    ''')
+
+    # Files owned by a user
     c.execute('''
     CREATE TABLE IF NOT EXISTS files(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,18 +133,38 @@ def init_db():
         stored_name TEXT,
         mime TEXT,
         size INTEGER,
-        uploaded_at TEXT
+        uploaded_at TEXT,
+        owner_id INTEGER NOT NULL,
+        FOREIGN KEY(owner_id) REFERENCES users(id)
     )
     ''')
+
+    # Sharing table: who else can access which file
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS file_access (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        can_read INTEGER NOT NULL DEFAULT 1,
+        can_delete INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(file_id, user_id),
+        FOREIGN KEY(file_id) REFERENCES files(id),
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    ''')
+
     conn.commit()
     conn.close()
 
-def add_file_record(orig_name, stored_name, mime, size):
+def add_file_record(orig_name, stored_name, mime, size, owner_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        'INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at) VALUES (?,?,?,?,?)',
-        (orig_name, stored_name, mime, size, datetime.datetime.utcnow().isoformat())
+        '''
+        INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at, owner_id)
+        VALUES (?,?,?,?,?,?)
+        ''',
+        (orig_name, stored_name, mime, size, datetime.datetime.utcnow().isoformat(), owner_id)
     )
     conn.commit()
     conn.close()
@@ -123,6 +211,62 @@ def guess_mime(filename, filebytes):
     except Exception:
         return "application/octet-stream"
 
+def get_user_by_username(username: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT id, username, password_hash, role, created_at FROM users WHERE username=?', (username,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def create_user(username: str, password: str, role: str = "user"):
+    if not validate_password_complexity(password):
+        raise ValueError("Weak password")
+    role = role.lower()
+    if role not in ("user", "admin"):
+        raise ValueError("Invalid role")
+    pw_hash = ph.hash(password)
+    now = datetime.datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO users(username, password_hash, role, created_at) VALUES (?,?,?,?)',
+        (username, pw_hash, role, now)
+    )
+    conn.commit()
+    conn.close()
+
+def list_files_for_user(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+    SELECT f.id, f.orig_name, f.stored_name, f.mime, f.size, f.uploaded_at, f.owner_id
+    FROM files f
+    LEFT JOIN file_access a ON f.id = a.file_id
+    WHERE f.owner_id = ? OR a.user_id = ?
+    ORDER BY f.uploaded_at DESC
+    ''', (user_id, user_id))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def user_can_access_file(user_id: int, file_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT owner_id FROM files WHERE id=?', (file_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    owner_id = row[0]
+    if owner_id == user_id:
+        conn.close()
+        return True
+    c.execute('SELECT 1 FROM file_access WHERE file_id=? AND user_id=? AND can_read=1', (file_id, user_id))
+    shared = c.fetchone() is not None
+    conn.close()
+    return shared
+
 # =========================================
 # ROUTES: ORIGINAL BIG APP (from app.py)
 # =========================================
@@ -132,7 +276,38 @@ def index():
     roles = [role.value for role in UserRole]
     return render_template('index.html', roles=roles)
 
+
+@app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")
+def login():
+    if request.method == 'POST':
+        username = request.form['username'].strip()
+        password = request.form['password']
+        row = get_user_by_username(username)
+        if row is None:
+            flash("Invalid username or password")
+            return redirect(url_for('login'))
+        user_id, uname, pw_hash, role, created_at = row
+        try:
+            ph.verify(pw_hash, password)
+        except VerifyMismatchError:
+            flash("Invalid username or password")
+            return redirect(url_for('login'))
+        session.clear()
+        session['user_id'] = user_id
+        flash("Logged in successfully.")
+        return redirect(url_for('files'))
+    return render_template('login.html')
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash("Logged out.")
+    return redirect(url_for('login'))
+
 @app.route('/upload', methods=['GET','POST'])
+@login_required
 def upload():
     if request.method == 'POST':
         if 'file' not in request.files:
@@ -156,17 +331,19 @@ def upload():
         with open(path, 'wb') as fh:
             fh.write(enc_blob)
 
-        add_file_record(orig_name, stored_name, mime, len(file_bytes))
+        add_file_record(orig_name, stored_name, mime, len(file_bytes), g.user['id'])
         flash("Uploaded and encrypted successfully.")
         return redirect(url_for('files'))
     return render_template('upload.html')
 
 @app.route('/files')
+@login_required
 def files():
-    rows = list_files()
-    return render_template('files.html', files=rows)
+    rows = list_files_for_user(g.user['id'])
+    return render_template('files.html', files=rows, current_user=g.user)
 
 @app.route('/download/<int:file_id>')
+@login_required
 def download(file_id):
     rec = get_file_record(file_id)
     if not rec:
@@ -187,6 +364,7 @@ def download(file_id):
     )
 
 @app.route('/preview/<int:file_id>')
+@login_required
 def preview(file_id):
     rec = get_file_record(file_id)
     if not rec:
@@ -202,9 +380,62 @@ def preview(file_id):
     return send_file(io.BytesIO(plaintext), mimetype=rec[3])
 
 @app.route('/delete/<int:file_id>', methods=['POST'])
+@login_required
 def delete(file_id):
+    # Only allow owner or admin to delete
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT owner_id FROM files WHERE id=?', (file_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("File not found.")
+        return redirect(url_for('files'))
+    owner_id = row[0]
+    if owner_id != g.user['id'] and g.user.get('role') != 'admin':
+        conn.close()
+        abort(403)
+    conn.close()
     ok = delete_file_record(file_id)
     flash("File deleted." if ok else "File not found.")
+    return redirect(url_for('files'))
+
+
+@app.route('/share/<int:file_id>', methods=['POST'])
+@login_required
+def share_file(file_id):
+    target_username = request.form.get('username', '').strip()
+    if not target_username:
+        flash("Username is required to share.")
+        return redirect(url_for('files'))
+    # Check that current user owns the file or is admin
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT owner_id FROM files WHERE id=?', (file_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        abort(404)
+    owner_id = row[0]
+    if owner_id != g.user['id'] and g.user['role'] != 'admin':
+        conn.close()
+        abort(403)
+    # Find target user
+    c.execute('SELECT id FROM users WHERE username=?', (target_username,))
+    dest = c.fetchone()
+    if not dest:
+        conn.close()
+        flash("Target user not found.")
+        return redirect(url_for('files'))
+    target_id = dest[0]
+    # Grant read access
+    c.execute('''
+        INSERT OR IGNORE INTO file_access(file_id, user_id, can_read, can_delete)
+        VALUES (?,?,1,0)
+    ''', (file_id, target_id))
+    conn.commit()
+    conn.close()
+    flash(f"File shared with {target_username}.")
     return redirect(url_for('files'))
 
 # ---- temp file APIs ----
@@ -260,45 +491,44 @@ def users():
         data = request.json
         if not data:
             return {'error': 'No data provided'}, 400
-        username = data.get('username')
+        username = (data.get('username') or "").strip()
         password = data.get('password')
         role = data.get('role', 'user')
         if not username or not password:
             return {'error': 'Username and password are required'}, 400
-        if username in USERS:
-            return {'error': 'Username already exists'}, 400
+        # enforce complexity (create_user also validates)
+        if not validate_password_complexity(password):
+            return {
+                'error': 'Weak password. Must be at least 12 characters and include upper, lower, number, and special character.'
+            }, 400
         try:
-            user_role = UserRole(role.lower())
-        except ValueError:
-            return {'error': 'Invalid role'}, 400
-        USERS[username] = {
-            'username': username,
-            'password_hash': generate_password_hash(password),
-            'role': user_role.value,
-            'created_at': datetime.datetime.utcnow().isoformat()
-        }
-        user_copy = USERS[username].copy()
-        del user_copy['password_hash']
-        return jsonify(user_copy), 201
-    return jsonify({
-        'users': [
-            {
-                'username': u,
-                'role': data['role'],
-                'created_at': data['created_at']
-            }
-            for u, data in USERS.items()
-        ]
-    })
+            create_user(username, password, role)
+        except ValueError as e:
+            return {'error': str(e)}, 400
+        except sqlite3.IntegrityError:
+            return {'error': 'Username already exists'}, 400
+
+        row = get_user_by_username(username)
+        if not row:
+            return {'error': 'Failed to create user'}, 500
+        user_id, uname, pw_hash, urole, created_at = row
+        return jsonify({'username': uname, 'role': urole, 'created_at': created_at}), 201
+
+    # GET: list users from DB (no password hashes)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT username, role, created_at FROM users ORDER BY id DESC')
+    rows = c.fetchall()
+    conn.close()
+    return jsonify({'users': [{'username': r[0], 'role': r[1], 'created_at': r[2]} for r in rows]})
 
 @app.route('/users/<username>')
 def get_user(username):
-    user = USERS.get(username)
-    if not user:
+    row = get_user_by_username(username)
+    if not row:
         return {'error': 'User not found'}, 404
-    user_copy = user.copy()
-    del user_copy['password_hash']
-    return jsonify(user_copy)
+    user_id, uname, pw_hash, role, created_at = row
+    return jsonify({'username': uname, 'role': role, 'created_at': created_at})
 
 # =========================================
 # SECOND (simple) uploader NAMESPACED
