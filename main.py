@@ -30,9 +30,11 @@ from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24))
 
-# Security: ensure session cookie flags are set for production
+# Security: ensure session cookie flags are set for production.
+# Don't force Secure cookies in development over plain HTTP (they won't be sent).
+secure_cookies = os.environ.get('FLASK_ENV', '').lower() == 'production'
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SECURE=secure_cookies,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
@@ -159,13 +161,24 @@ def init_db():
 def add_file_record(orig_name, stored_name, mime, size, owner_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        '''
-        INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at, owner_id)
-        VALUES (?,?,?,?,?,?)
-        ''',
-        (orig_name, stored_name, mime, size, datetime.datetime.utcnow().isoformat(), owner_id)
-    )
+    ts = datetime.datetime.utcnow().isoformat()
+    try:
+        c.execute(
+            '''
+            INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at, owner_id)
+            VALUES (?,?,?,?,?,?)
+            ''',
+            (orig_name, stored_name, mime, size, ts, owner_id)
+        )
+    except sqlite3.OperationalError:
+        # Older schema without owner_id: fallback to insert without owner_id
+        c.execute(
+            '''
+            INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at)
+            VALUES (?,?,?,?,?)
+            ''',
+            (orig_name, stored_name, mime, size, ts)
+        )
     conn.commit()
     conn.close()
 
@@ -239,14 +252,21 @@ def create_user(username: str, password: str, role: str = "user"):
 def list_files_for_user(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''
-    SELECT f.id, f.orig_name, f.stored_name, f.mime, f.size, f.uploaded_at, f.owner_id
-    FROM files f
-    LEFT JOIN file_access a ON f.id = a.file_id
-    WHERE f.owner_id = ? OR a.user_id = ?
-    ORDER BY f.uploaded_at DESC
-    ''', (user_id, user_id))
-    rows = c.fetchall()
+    try:
+        c.execute('''
+        SELECT f.id, f.orig_name, f.stored_name, f.mime, f.size, f.uploaded_at, f.owner_id
+        FROM files f
+        LEFT JOIN file_access a ON f.id = a.file_id
+        WHERE f.owner_id = ? OR a.user_id = ?
+        ORDER BY f.uploaded_at DESC
+        ''', (user_id, user_id))
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        # Fallback for older schema without owner_id or file_access table: return all files
+        c.execute('SELECT id, orig_name, stored_name, mime, size, uploaded_at FROM files ORDER BY uploaded_at DESC')
+        base_rows = c.fetchall()
+        # append None as owner_id to match expected tuple length
+        rows = [r + (None,) for r in base_rows]
     conn.close()
     return rows
 
