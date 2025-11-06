@@ -23,12 +23,166 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import re  # for password complexity
 from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
+import os, sqlite3, datetime
+from flask import Blueprint, request, redirect, url_for, session, flash, send_file, abort, current_app, render_template_string
+from dotenv import load_dotenv
+load_dotenv()
 
 # =========================================
 # SHARED APP
 # =========================================
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(24))
+
+# ====== BEGIN QUICK SHARE BLUEPRINT (self-contained) ======
+from flask import Blueprint, request, redirect, url_for, session, flash, send_file, abort, current_app, render_template_string
+
+sharebp = Blueprint("sharebp", __name__, url_prefix="/share")
+DB = "files.db"
+
+def _ensure_share_table():
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS shares(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      file_id INTEGER NOT NULL,
+      from_email TEXT NOT NULL,
+      to_email TEXT NOT NULL,
+      can_download INTEGER DEFAULT 1,
+      expires_at TEXT,
+      created_at TEXT
+    )""")
+    conn.commit(); conn.close()
+
+def _me(): return session.get("user_email")
+
+@sharebp.before_app_request
+def _boot_share():
+    _ensure_share_table()
+
+@sharebp.route("/login", methods=["GET","POST"])
+def share_login():
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        if email:
+            session["user_email"] = email
+            flash(f"Logged in as {email}")
+            return redirect(url_for("sharebp.files"))
+        flash("Enter an email")
+    return render_template_string("""
+      <h2>Login (demo)</h2>
+      <form method=post>
+        <input name=email type=email required placeholder="you@example.com">
+        <button>Login</button>
+      </form>
+      <p><a href="{{ url_for('sharebp.files') }}">Back</a></p>
+    """)
+
+@sharebp.route("/logout")
+def share_logout():
+    session.clear(); flash("Logged out.")
+    return redirect(url_for("sharebp.files"))
+
+@sharebp.route("/")
+def files():
+    # List files from existing 'files' table (your app already has it)
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute("SELECT id, orig_name, size, uploaded_at FROM files ORDER BY id DESC")
+    rows = c.fetchall(); conn.close()
+    return render_template_string("""
+      <h2>Files</h2>
+      <p>
+        {% if me %}Logged in as {{me}} |
+          <a href="{{url_for('sharebp.shared')}}">Shared With Me</a> |
+          <a href="{{url_for('sharebp.logout')}}">Logout</a>
+        {% else %}
+          <a href="{{url_for('sharebp.login')}}">Login</a>
+        {% endif %}
+      </p>
+      {% if rows %}
+        <table border=1 cellpadding=6>
+          <tr><th>ID</th><th>Name</th><th>Size</th><th>Uploaded</th><th>Action</th></tr>
+          {% for r in rows %}
+            <tr>
+              <td>{{r[0]}}</td><td>{{r[1]}}</td><td>{{r[2]}}</td><td>{{r[3]}}</td>
+              <td><a href="{{ url_for('sharebp.share', file_id=r[0]) }}">Share</a></td>
+            </tr>
+          {% endfor %}
+        </table>
+      {% else %}<p>No files yet.</p>{% endif %}
+      <p><a href="/">Home</a></p>
+    """, rows=rows, me=_me())
+
+@sharebp.route("/share/<int:file_id>", methods=["GET","POST"])
+def share(file_id):
+    if not _me(): return redirect(url_for("sharebp.login"))
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute("SELECT id, orig_name FROM files WHERE id=?", (file_id,)); f = c.fetchone()
+    conn.close()
+    if not f: abort(404)
+    if request.method == "POST":
+        to = (request.form.get("to") or "").strip().lower()
+        days = int((request.form.get("days") or "7") or "7")
+        exp = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat()+"Z"
+        conn = sqlite3.connect(DB); c = conn.cursor()
+        c.execute("""INSERT INTO shares(file_id, from_email, to_email, can_download, expires_at, created_at)
+                     VALUES (?,?,?,?,?,?)""",
+                  (file_id, _me(), to, 1, exp, datetime.datetime.utcnow().isoformat()+"Z"))
+        conn.commit(); conn.close()
+        flash(f"Shared {f[1]} with {to} for {days} days.")
+        return redirect(url_for("sharebp.files"))
+    return render_template_string("""
+      <h3>Share: {{f[1]}} (ID {{f[0]}})</h3>
+      <form method=post>
+        <input name=to type=email required placeholder="bob@example.com">
+        <input name=days type=number min=1 value=7>
+        <button>Share</button>
+      </form>
+      <p><a href="{{ url_for('sharebp.files') }}">Back</a></p>
+    """, f=f)
+
+@sharebp.route("/shared")
+def shared():
+    if not _me(): return redirect(url_for("sharebp.login"))
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute("""SELECT f.id, f.orig_name, s.from_email, s.expires_at
+                 FROM shares s JOIN files f ON s.file_id=f.id
+                 WHERE s.to_email=? AND s.can_download=1""", (_me(),))
+    rows = c.fetchall(); conn.close()
+    return render_template_string("""
+      <h3>Shared With Me</h3>
+      <table border=1 cellpadding=6>
+        <tr><th>File ID</th><th>Name</th><th>From</th><th>Expires</th><th>Action</th></tr>
+        {% for r in rows %}
+          <tr>
+            <td>{{r[0]}}</td><td>{{r[1]}}</td><td>{{r[2]}}</td><td>{{r[3]}}</td>
+            <td><a href="{{ url_for('sharebp.download', file_id=r[0]) }}">Download</a></td>
+          </tr>
+        {% endfor %}
+        {% if not rows %}<tr><td colspan=5>Nothing yet.</td></tr>{% endif %}
+      </table>
+      <p><a href="{{ url_for('sharebp.files') }}">Back</a></p>
+    """, rows=rows)
+
+@sharebp.route("/download/<int:file_id>")
+def download(file_id):
+    if not _me(): return redirect(url_for("sharebp.login"))
+    conn = sqlite3.connect(DB); c = conn.cursor()
+    c.execute("""SELECT COUNT(*) FROM shares WHERE file_id=? AND to_email=? AND can_download=1""",
+              (file_id, _me()))
+    ok = c.fetchone()[0] > 0
+    if not ok:
+        flash("No access."); return redirect(url_for("sharebp.shared"))
+    c.execute("SELECT stored_name, orig_name FROM files WHERE id=?", (file_id,))
+    row = c.fetchone(); conn.close()
+    if not row: abort(404)
+    stored, display = row
+    path = os.path.join(current_app.config.get("UPLOAD_FOLDER","uploads"), stored)
+    if not os.path.exists(path): abort(404)
+    return send_file(path, as_attachment=True, download_name=display)
+# ====== END QUICK SHARE BLUEPRINT ======
+
+
+
 
 # Security: ensure session cookie flags are set for production.
 # Don't force Secure cookies in development over plain HTTP (they won't be sent).
@@ -677,6 +831,7 @@ def simple_preview(filename):
     return send_file(bio, mimetype=mtype or "application/octet-stream")
 
 # =========================================
+app.register_blueprint(sharebp)
 if __name__ == "__main__":
     init_db()
     app.run(host="127.0.0.1", port=5000, debug=True)
