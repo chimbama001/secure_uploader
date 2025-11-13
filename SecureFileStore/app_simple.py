@@ -1,4 +1,12 @@
-from flask import Flask, request, redirect, url_for, render_template_string, send_file, abort
+from flask import (
+    Flask,
+    request,
+    redirect,
+    url_for,
+    render_template_string,
+    send_file,
+    abort,
+)
 from werkzeug.utils import secure_filename
 from pathlib import Path
 from io import BytesIO
@@ -23,26 +31,32 @@ if not SALT_PATH.exists():
     SALT_PATH.write_bytes(secrets.token_bytes(16))
 SALT = SALT_PATH.read_bytes()
 
+
 def derive_key(passphrase: str, salt: bytes) -> bytes:
     kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
     return kdf.derive(passphrase.encode())
 
+
 KEY = derive_key(PASSPHRASE, SALT)  # 32 bytes (AES-256)
 
+
 def encrypt_bytes(plaintext: bytes) -> bytes:
-    nonce = secrets.token_bytes(12)           # 96-bit nonce for GCM
+    nonce = secrets.token_bytes(12)  # 96-bit nonce for GCM
     aes = AESGCM(KEY)
     ct = aes.encrypt(nonce, plaintext, None)  # AAD=None
-    return nonce + ct                          # store nonce || ciphertext(tag+data)
+    return nonce + ct  # store nonce || ciphertext(tag+data)
+
 
 def decrypt_blob(blob: bytes) -> bytes:
     nonce, ct = blob[:12], blob[12:]
     aes = AESGCM(KEY)
     return aes.decrypt(nonce, ct, None)
 
+
 def is_image(filename: str) -> bool:
     mtype, _ = mimetypes.guess_type(filename)
     return (mtype or "").startswith("image/")
+
 
 INDEX_HTML = """
 <!doctype html>
@@ -68,14 +82,19 @@ INDEX_HTML = """
 </ul>
 """
 
+
 @app.route("/")
 def index():
     items = []
     # list *.enc files and show original names (strip .enc)
-    for p in sorted([p for p in UPLOAD_DIR.iterdir() if p.is_file() and p.suffix == ".enc"], key=lambda x: x.name.lower()):
+    for p in sorted(
+        [p for p in UPLOAD_DIR.iterdir() if p.is_file() and p.suffix == ".enc"],
+        key=lambda x: x.name.lower(),
+    ):
         original = p.stem  # filename without .enc
         items.append({"name": original, "is_image": is_image(original)})
     return render_template_string(INDEX_HTML, files=items)
+
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -107,6 +126,7 @@ def upload():
     enc_path.write_bytes(blob)
     return redirect(url_for("index"))
 
+
 @app.route("/download/<path:filename>")
 def download(filename):
     # encrypted file is stored as "<filename>.enc"
@@ -121,8 +141,15 @@ def download(filename):
         abort(500, description=f"Decryption failed: {e}")
 
     mtype, _ = mimetypes.guess_type(safe_name)
-    bio = BytesIO(plaintext); bio.seek(0)
-    return send_file(bio, as_attachment=True, download_name=safe_name, mimetype=mtype or "application/octet-stream")
+    bio = BytesIO(plaintext)
+    bio.seek(0)
+    return send_file(
+        bio,
+        as_attachment=True,
+        download_name=safe_name,
+        mimetype=mtype or "application/octet-stream",
+    )
+
 
 @app.route("/preview/<path:filename>")
 def preview(filename):
@@ -140,8 +167,10 @@ def preview(filename):
         abort(500, description=f"Decryption failed: {e}")
 
     mtype, _ = mimetypes.guess_type(safe_name)
-    bio = BytesIO(plaintext); bio.seek(0)
+    bio = BytesIO(plaintext)
+    bio.seek(0)
     return send_file(bio, mimetype=mtype or "application/octet-stream")
+
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
