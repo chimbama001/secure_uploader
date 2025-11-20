@@ -155,6 +155,21 @@ def init_db():
     )
     ''')
 
+    # Messages/notifications created when a file is shared
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS file_messages(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+        recipient_id INTEGER NOT NULL,
+        message TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(file_id) REFERENCES files(id),
+        FOREIGN KEY(sender_id) REFERENCES users(id),
+        FOREIGN KEY(recipient_id) REFERENCES users(id)
+    )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -425,6 +440,7 @@ def delete(file_id):
 @login_required
 def share_file(file_id):
     target_username = request.form.get('username', '').strip()
+    message = request.form.get('message', '').strip()
     if not target_username:
         flash("Username is required to share.")
         return redirect(url_for('files'))
@@ -453,9 +469,64 @@ def share_file(file_id):
         INSERT OR IGNORE INTO file_access(file_id, user_id, can_read, can_delete)
         VALUES (?,?,1,0)
     ''', (file_id, target_id))
+    # Insert a message/notification record for recipient
+    try:
+        ts = datetime.datetime.utcnow().isoformat()
+        c.execute('''
+            INSERT INTO file_messages(file_id, sender_id, recipient_id, message, created_at)
+            VALUES (?,?,?,?,?)
+        ''', (file_id, g.user['id'], target_id, message, ts))
+    except Exception:
+        # If table doesn't exist or other issue, ignore so sharing still works
+        pass
     conn.commit()
     conn.close()
     flash(f"File shared with {target_username}.")
+    return redirect(url_for('files'))
+
+
+@app.route('/inbox')
+@login_required
+def inbox():
+    # List messages sent to current user
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute('''
+            SELECT m.id, m.file_id, f.orig_name, m.sender_id, s.username, m.message, m.created_at
+            FROM file_messages m
+            JOIN users s ON m.sender_id = s.id
+            JOIN files f ON m.file_id = f.id
+            WHERE m.recipient_id = ?
+            ORDER BY m.created_at DESC
+        ''', (g.user['id'],))
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return render_template('inbox.html', messages=rows)
+
+
+@app.route('/revoke/<int:file_id>/<int:target_id>', methods=['POST'])
+@login_required
+def revoke_access(file_id, target_id):
+    # Only owner or admin can revoke
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT owner_id FROM files WHERE id=?', (file_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        flash("File not found.")
+        return redirect(url_for('files'))
+    owner_id = row[0]
+    if owner_id != g.user['id'] and g.user.get('role') != 'admin':
+        conn.close()
+        abort(403)
+    c.execute('DELETE FROM file_access WHERE file_id=? AND user_id=?', (file_id, target_id))
+    conn.commit()
+    conn.close()
+    flash('Access revoked.')
     return redirect(url_for('files'))
 
 # ---- temp file APIs ----
