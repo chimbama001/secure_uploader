@@ -11,7 +11,7 @@
       {% endif %}
     {% endwith %}
     <p>
-      <a href="{{ url_for('upload') }}">Upload new</a> | <a href="{{ url_for('index') }}">Home</a>
+      <a href="{{ url_for('upload') }}">Upload new</a> | <a href="{{ url_for('index') }}">Home</a> | <a href="{{ url_for('inbox') }}">Inbox</a>
       {% if current_user %}
         | Logged in as: <strong>{{ current_user.username }}</strong>
         | <a href="{{ url_for('logout') }}">Logout</a>
@@ -39,6 +39,7 @@
               <!-- Share form for owners/admin -->
               <form style="display:inline" method="post" action="{{ url_for('share_file', file_id=f[0]) }}">
                 <input name="username" placeholder="share with user" />
+                <input name="message" placeholder="optional message" />
                 <button type="submit">Share</button>
               </form>
             {% endif %}

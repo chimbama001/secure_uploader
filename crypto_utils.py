@@ -4,7 +4,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 def load_key_from_env(base64_key: str):
     """Accepts a URL-safe base64 key string and returns bytes (32 bytes expected)."""
-    key = base64.urlsafe_b64decode(base64_key)
+    # Accept keys with or without padding. If padding is missing, add it.
+    b64 = base64_key
+    # base64 strings should be a multiple of 4 in length
+    padding = -len(b64) % 4
+    if padding:
+        b64 = b64 + ('=' * padding)
+    key = base64.urlsafe_b64decode(b64)
     if len(key) != 32:
         raise ValueError("Encryption key must be 32 bytes (base64 of 32 bytes).")
     return key
