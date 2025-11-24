@@ -101,9 +101,39 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # ------------------ encryption (original app.py) ------------------
+# Load encryption key from env, or fall back to a persistent key file in DATA_DIR
+# If none found, generate a new random key (warn) and persist it so subsequent
+# runs can decrypt previously uploaded files.
 ENC_KEY_B64 = os.environ.get("UPLOAD_ENC_KEY")
+key_persist_path = None
 if not ENC_KEY_B64:
-    raise RuntimeError("UPLOAD_ENC_KEY must be set (base64 of 32 bytes).")
+    # try to load from a key file inside DATA_DIR (if set) or repo root
+    store_dir = DATA_DIR if DATA_DIR else os.getcwd()
+    key_persist_path = os.path.join(store_dir, ".upload_enc_key")
+    try:
+        if os.path.exists(key_persist_path):
+            with open(key_persist_path, "r") as kf:
+                ENC_KEY_B64 = kf.read().strip()
+    except Exception:
+        ENC_KEY_B64 = None
+
+if not ENC_KEY_B64:
+    # generate a new one and persist it (informative warning)
+    import base64 as _base64
+    new_key = _base64.urlsafe_b64encode(os.urandom(32)).decode()
+    ENC_KEY_B64 = new_key
+    try:
+        if not key_persist_path:
+            store_dir = DATA_DIR if DATA_DIR else os.getcwd()
+            key_persist_path = os.path.join(store_dir, ".upload_enc_key")
+        os.makedirs(os.path.dirname(key_persist_path), exist_ok=True)
+        with open(key_persist_path, "w") as kf:
+            kf.write(ENC_KEY_B64)
+        print(f"[WARNING] No UPLOAD_ENC_KEY provided; generated and saved key to {key_persist_path}")
+    except Exception:
+        # best-effort: print warning but continue with in-memory key
+        print("[WARNING] No UPLOAD_ENC_KEY provided and failed to persist key; using ephemeral key for this run.")
+
 ENCKEY = load_key_from_env(ENC_KEY_B64)
 
 # ------------------ temp files (original app.py) ------------------
@@ -287,9 +317,7 @@ def user_can_access_file(user_id: int, file_id: int):
     conn.close()
     return shared
 
-# =========================================
-# ROUTES: ORIGINAL BIG APP (from app.py)
-# =========================================
+
 @app.route('/')
 def index():
     # main UI
@@ -558,7 +586,6 @@ def get_user(username):
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import mimetypes, secrets
-
 SIMPLE_UPLOAD_DIR = Path("uploads")
 SIMPLE_UPLOAD_DIR.mkdir(exist_ok=True)
 

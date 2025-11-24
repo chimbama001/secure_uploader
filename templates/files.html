@@ -37,7 +37,7 @@
             </form>
             {% if current_user and (current_user.id == f[6] or current_user.role == 'admin') %}
               <!-- Share form for owners/admin -->
-              <form style="display:inline" method="post" action="{{ url_for('share', file_id=f[0]) }}">
+              <form style="display:inline" method="post" action="{{ url_for('share_file', file_id=f[0]) }}">
                 <input name="username" placeholder="share with user" />
                 <button type="submit">Share</button>
               </form>
