@@ -1,35 +1,32 @@
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Inbox</title></head>
-  <body>
-    <h1>Inbox</h1>
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        <ul>
-        {% for m in messages %}<li>{{ m }}</li>{% endfor %}
-        </ul>
-      {% endif %}
-    {% endwith %}
-    <p><a href="{{ url_for('files') }}">My Files</a> | <a href="{{ url_for('index') }}">Home</a></p>
-    {% if messages %}
-      <table border="1" cellpadding="6">
-        <tr><th>When</th><th>From</th><th>File</th><th>Message</th><th>Actions</th></tr>
-        {% for m in messages %}
-        <tr>
-          <td>{{ m[6] }}</td>
-          <td>{{ m[4] }}</td>
-          <td><a href="{{ url_for('download', file_id=m[1]) }}">{{ m[2] }}</a></td>
-          <td>{{ m[5] }}</td>
-          <td>
-            <!-- No accept required because sharing already grants access; allow revoke if owner -->
-            <!-- Revoke is a POST to /revoke/<file_id>/<target_id> but only owner/admin will see button elsewhere -->
-            
-          </td>
-        </tr>
-        {% endfor %}
-      </table>
-    {% else %}
-      <p>No messages.</p>
-    {% endif %}
-  </body>
-</html>
+{% extends 'base.html' %}
+
+{% block title %}Inbox - Secure Uploader{% endblock %}
+
+{% block content %}
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2>Inbox</h2>
+    <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('files') }}">My Files</a>
+  </div>
+
+  {% if messages %}
+    <div class="card">
+      <div class="table-responsive">
+        <table class="table table-striped mb-0">
+          <thead class="table-light"><tr><th>When</th><th>From</th><th>File</th><th>Message</th></tr></thead>
+          <tbody>
+          {% for m in messages %}
+          <tr>
+            <td>{{ m[6] }}</td>
+            <td>{{ m[4] }}</td>
+            <td><a href="{{ url_for('download', file_id=m[1]) }}">{{ m[2] }}</a></td>
+            <td>{{ m[5] }}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% else %}
+    <p class="text-muted">No messages.</p>
+  {% endif %}
+{% endblock %}

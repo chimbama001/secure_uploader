@@ -5,3 +5,4 @@ python-magic==0.4.27
 python-dotenv==1.0.0
 argon2-cffi==21.3.0
 Flask-Limiter==2.8.0
+azure-storage-blob==12.27.1

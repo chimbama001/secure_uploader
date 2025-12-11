@@ -2,3 +2,20 @@
 cryptography==41.0.3
 python-dotenv==1.0.1
 python-magic==0.4.27
+gunicorn==21.2.0
+
+# Run instructions:
+# Windows PowerShell:
+#   cd "c:\Users\Kirk\secure_uploader\SecureFileStore"
+#   python -m venv venv
+#   .\venv\Scripts\Activate
+#   pip install -r requirements.txt
+#   python app.py
+# Or using flask CLI:
+#   $env:FLASK_APP = 'app.py'
+#   flask run --host=0.0.0.0 --port=5000
+# Production (Gunicorn, Unix):
+#   python3 -m venv venv && source venv/bin/activate
+#   pip install -r requirements.txt
+#   gunicorn wsgi:app
+

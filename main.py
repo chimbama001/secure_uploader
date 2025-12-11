@@ -8,8 +8,15 @@ import enum
 from pathlib import Path
 from io import BytesIO
 
-from dotenv import load_dotenv
-load_dotenv()
+# Optional: load .env only if python-dotenv is installed
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ModuleNotFoundError:
+    # In production (Azure) we expect env vars to be set by App Service,
+    # so it's OK if python-dotenv is not installed.
+    pass
+
 
 from functools import wraps
 from flask import (
@@ -23,6 +30,10 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import re  # for password complexity
 from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
+try:
+    from azure.storage.blob import BlobServiceClient
+except Exception:
+    BlobServiceClient = None
 
 # =========================================
 # SHARED APP
@@ -139,6 +150,83 @@ ENCKEY = load_key_from_env(ENC_KEY_B64)
 # ------------------ temp files (original app.py) ------------------
 TEMP_FILES = {}
 
+# ------------------ storage backend (local filesystem or Azure Blob) ------------------
+USE_AZURE_BLOBS = False
+AZ_BLOB_CLIENT = None
+AZ_BLOB_CONTAINER = None
+if BlobServiceClient is not None:
+    # prefer an explicit connection string from env
+    AZ_CONN = os.environ.get('AZURE_STORAGE_CONNECTION_STRING') or os.environ.get('AZURE_BLOB_CONNECTION_STRING')
+    AZ_CONTAINER = os.environ.get('AZURE_BLOB_CONTAINER')
+    if AZ_CONN and AZ_CONTAINER:
+        try:
+            AZ_BLOB_CLIENT = BlobServiceClient.from_connection_string(AZ_CONN)
+            AZ_BLOB_CONTAINER = AZ_CONTAINER
+            # ensure container exists
+            try:
+                AZ_BLOB_CLIENT.create_container(AZ_BLOB_CONTAINER)
+            except Exception:
+                pass
+            USE_AZURE_BLOBS = True
+            print('[INFO] Using Azure Blob Storage container:', AZ_BLOB_CONTAINER)
+        except Exception as e:
+            print('[WARN] Failed to initialize Azure Blob client:', e)
+
+def storage_save_bytes(stored_name: str, data: bytes) -> None:
+    """Save bytes either locally or to Azure blob storage depending on config."""
+    if USE_AZURE_BLOBS and AZ_BLOB_CLIENT is not None:
+        blob = AZ_BLOB_CLIENT.get_blob_client(container=AZ_BLOB_CONTAINER, blob=stored_name)
+        blob.upload_blob(data, overwrite=True)
+    else:
+        path = os.path.join(app.config['UPLOAD_FOLDER'], stored_name)
+        with open(path, 'wb') as fh:
+            fh.write(data)
+
+def storage_read_bytes(stored_name: str) -> bytes:
+    if USE_AZURE_BLOBS and AZ_BLOB_CLIENT is not None:
+        blob = AZ_BLOB_CLIENT.get_blob_client(container=AZ_BLOB_CONTAINER, blob=stored_name)
+        downloader = blob.download_blob()
+        return downloader.readall()
+    else:
+        path = os.path.join(app.config['UPLOAD_FOLDER'], stored_name)
+        with open(path, 'rb') as fh:
+            return fh.read()
+
+def storage_delete(stored_name: str) -> None:
+    if USE_AZURE_BLOBS and AZ_BLOB_CLIENT is not None:
+        try:
+            blob = AZ_BLOB_CLIENT.get_blob_client(container=AZ_BLOB_CONTAINER, blob=stored_name)
+            blob.delete_blob()
+        except Exception:
+            pass
+    else:
+        path = os.path.join(app.config['UPLOAD_FOLDER'], stored_name)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+
+# Make encryption + storage status available in templates
+@app.context_processor
+def inject_app_status():
+    # provide file count (fast) for UI badges
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM files')
+        fc = c.fetchone()[0]
+        conn.close()
+    except Exception:
+        fc = 0
+    return {
+        'ENCRYPTION_AVAILABLE': ENCKEY is not None,
+        'USE_AZURE_BLOBS': USE_AZURE_BLOBS,
+        'AZ_BLOB_CONTAINER': AZ_BLOB_CONTAINER if 'AZ_BLOB_CONTAINER' in globals() else None,
+        'FILE_COUNT': fc,
+    }
+
 # =========================================
 # DB HELPERS (original app.py)
 # =========================================
@@ -203,27 +291,51 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_file_record(orig_name, stored_name, mime, size, owner_id):
+    # Ensure `client_encrypted` column exists on `files` table for marking client-side encrypted uploads
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("PRAGMA table_info(files)")
+        cols = [r[1] for r in c.fetchall()]
+        if 'client_encrypted' not in cols:
+            c.execute('ALTER TABLE files ADD COLUMN client_encrypted INTEGER NOT NULL DEFAULT 0')
+            conn.commit()
+    except Exception:
+        # best-effort: ignore if table missing (shouldn't happen) or ALTER not supported
+        pass
+    conn.close()
+
+def add_file_record(orig_name, stored_name, mime, size, owner_id=None, client_encrypted: bool = False):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     ts = datetime.datetime.utcnow().isoformat()
     try:
+        # Preferred: include owner_id and client_encrypted
         c.execute(
             '''
-            INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at, owner_id)
-            VALUES (?,?,?,?,?,?)
+            INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted)
+            VALUES (?,?,?,?,?,?,?)
             ''',
-            (orig_name, stored_name, mime, size, ts, owner_id)
+            (orig_name, stored_name, mime, size, ts, owner_id, 1 if client_encrypted else 0)
         )
     except sqlite3.OperationalError:
-        # Older schema without owner_id: fallback to insert without owner_id
-        c.execute(
-            '''
-            INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at)
-            VALUES (?,?,?,?,?)
-            ''',
-            (orig_name, stored_name, mime, size, ts)
-        )
+        # Older schema variants: try without client_encrypted, then without owner_id
+        try:
+            c.execute(
+                '''
+                INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at, owner_id)
+                VALUES (?,?,?,?,?,?)
+                ''',
+                (orig_name, stored_name, mime, size, ts, owner_id)
+            )
+        except sqlite3.OperationalError:
+            c.execute(
+                '''
+                INSERT INTO files(orig_name, stored_name, mime, size, uploaded_at)
+                VALUES (?,?,?,?,?)
+                ''',
+                (orig_name, stored_name, mime, size, ts)
+            )
     conn.commit()
     conn.close()
 
@@ -238,7 +350,8 @@ def list_files():
 def get_file_record(file_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT id, orig_name, stored_name, mime, size, uploaded_at FROM files WHERE id=?', (file_id,))
+    # include client_encrypted flag (added later to schema) so download can decide whether to decrypt
+    c.execute('SELECT id, orig_name, stored_name, mime, size, uploaded_at, client_encrypted FROM files WHERE id=?', (file_id,))
     row = c.fetchone()
     conn.close()
     return row
@@ -248,12 +361,11 @@ def delete_file_record(file_id):
     if not rec:
         return False
     stored_name = rec[2]
-    path = os.path.join(UPLOAD_FOLDER, stored_name)
-    if os.path.exists(path):
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+    # remove from storage (local or Azure Blob)
+    try:
+        storage_delete(stored_name)
+    except Exception:
+        pass
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('DELETE FROM files WHERE id=?', (file_id,))
@@ -385,16 +497,28 @@ def upload():
         file_bytes = f.read()
         mime = guess_mime(orig_name, file_bytes)
 
-        if ENCKEY is None:
-            abort(500, description="Server encryption key not set.")
-        enc_blob = encrypt_bytes(file_bytes, ENCKEY)
+        # If the client already encrypted the file (browser-side), it should include a flag
+        client_encrypted = request.form.get('client_encrypted') == '1' or request.headers.get('X-Client-Encrypted') == '1'
+
+        if client_encrypted:
+            # store as-is; server will not attempt to decrypt these files
+            enc_blob = file_bytes
+        else:
+            if ENCKEY is None:
+                abort(500, description="Server encryption key not set.")
+            enc_blob = encrypt_bytes(file_bytes, ENCKEY)
 
         stored_name = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip('=') + ".bin"
-        path = os.path.join(app.config['UPLOAD_FOLDER'], stored_name)
-        with open(path, 'wb') as fh:
-            fh.write(enc_blob)
+        # Save to configured storage (local filesystem or Azure Blob)
+        try:
+            storage_save_bytes(stored_name, enc_blob)
+        except Exception:
+            # fallback to local write
+            path = os.path.join(app.config['UPLOAD_FOLDER'], stored_name)
+            with open(path, 'wb') as fh:
+                fh.write(enc_blob)
 
-        add_file_record(orig_name, stored_name, mime, len(file_bytes), g.user['id'])
+        add_file_record(orig_name, stored_name, mime, len(file_bytes), g.user.get('id') if g.user else None, client_encrypted=client_encrypted)
         flash("Uploaded and encrypted successfully.")
         return redirect(url_for('files'))
     return render_template('upload.html')
@@ -411,11 +535,26 @@ def download(file_id):
     rec = get_file_record(file_id)
     if not rec:
         abort(404)
-    path = os.path.join(app.config['UPLOAD_FOLDER'], rec[2])
-    if not os.path.exists(path):
+    try:
+        enc_blob = storage_read_bytes(rec[2])
+    except Exception:
         abort(404)
-    with open(path, 'rb') as fh:
-        enc_blob = fh.read()
+    # rec includes client_encrypted at position 6 (0-based index)
+    client_encrypted = False
+    try:
+        client_encrypted = bool(rec[6])
+    except Exception:
+        client_encrypted = False
+
+    if client_encrypted:
+        # Return the stored blob as-is; client is expected to decrypt locally
+        return send_file(
+            io.BytesIO(enc_blob),
+            download_name=rec[1] or "download",
+            mimetype=rec[3] or "application/octet-stream",
+            as_attachment=True
+        )
+
     if ENCKEY is None:
         abort(500, description="Server encryption key not set.")
     plaintext = decrypt_bytes(enc_blob, ENCKEY)
@@ -434,9 +573,21 @@ def preview(file_id):
         abort(404)
     if not (rec[3] or "").startswith("image/"):
         return redirect(url_for('files'))
-    path = os.path.join(app.config['UPLOAD_FOLDER'], rec[2])
-    with open(path, 'rb') as fh:
-        enc_blob = fh.read()
+    try:
+        enc_blob = storage_read_bytes(rec[2])
+    except Exception:
+        abort(404)
+
+    # if client-encrypted, return as-is (client should decrypt)
+    client_encrypted = False
+    try:
+        client_encrypted = bool(rec[6])
+    except Exception:
+        client_encrypted = False
+
+    if client_encrypted:
+        return send_file(io.BytesIO(enc_blob), mimetype=rec[3])
+
     if ENCKEY is None:
         abort(500, description="Server encryption key not set.")
     plaintext = decrypt_bytes(enc_blob, ENCKEY)
@@ -777,4 +928,8 @@ def simple_preview(filename):
 # =========================================
 if __name__ == "__main__":
     init_db()
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    # Allow overriding the host/port via environment for easier local network testing or docker use.
+    run_host = os.environ.get('FLASK_RUN_HOST', os.environ.get('HOST', '127.0.0.1'))
+    run_port = int(os.environ.get('PORT', 5000))
+    run_debug = os.environ.get('FLASK_DEBUG', '1').lower() in ('1', 'true', 'yes')
+    app.run(host=run_host, port=run_port, debug=run_debug)
