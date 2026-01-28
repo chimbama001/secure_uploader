@@ -54,7 +54,8 @@ app.config.update(
 ph = PasswordHasher()
 
 # Rate limiter
-limiter = Limiter(app, key_func=get_remote_address)
+limiter = Limiter(key_func=get_remote_address)
+limiter.init_app(app)
 
 # ------------------ user roles ------------------
 class UserRole(enum.Enum):
@@ -79,6 +80,18 @@ def login_required(view_func):
             return redirect(url_for('login'))
         return view_func(*args, **kwargs)
     return wrapped
+
+from functools import wraps
+from flask import abort
+
+def require_admin(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not g.user or g.user.get("role") != "admin":
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated_function
+
 
 
 @app.before_request
@@ -751,11 +764,15 @@ def delete_temp_file(file_id):
 
 # ---- users ----
 @app.route('/add-user')
+@login_required
+@require_admin
 def add_user_form():
     roles = [role.value for role in UserRole]
     return render_template('add_user.html', roles=roles)
 
 @app.route('/users', methods=['GET','POST'])
+@login_required
+@require_admin
 def users():
     if request.method == 'POST':
         data = request.json
