@@ -548,6 +548,11 @@ def download(file_id):
     rec = get_file_record(file_id)
     if not rec:
         abort(404)
+
+    # FR-5 Least Privilege: only owner, shared user, or admin
+    if not user_can_access_file(g.user['id'], file_id) and g.user.get('role') != 'admin':
+        abort(403)
+
     try:
         enc_blob = storage_read_bytes(rec[2])
     except Exception:
@@ -584,6 +589,9 @@ def preview(file_id):
     rec = get_file_record(file_id)
     if not rec:
         abort(404)
+    # FR-5 Least Privilege: only owner, shared user, or admin
+    if not user_can_access_file(g.user['id'], file_id) and g.user.get('role') != 'admin':
+        abort(403)
     if not (rec[3] or "").startswith("image/"):
         return redirect(url_for('files'))
     try:
