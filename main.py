@@ -61,10 +61,13 @@ class UserRole(enum.Enum):
     USER = "user"
     ADMIN = "admin"
 
+# Control 2: Password Security Enforcement
+# Enforces minimum 12 characters, at least one lower, one upper, one digit, and one special char.
 PASSWORD_REGEX = re.compile(
     r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#^])[A-Za-z\d@$!%*?&#^]{12,}$'
 )
 
+# Control 2: Password Security Enforcement
 def validate_password_complexity(pw: str) -> bool:
     """At least 12 chars, upper, lower, number, special."""
     return bool(PASSWORD_REGEX.match(pw))
@@ -173,6 +176,10 @@ if BlobServiceClient is not None:
             print('[WARN] Failed to initialize Azure Blob client:', e)
 
 def storage_save_bytes(stored_name: str, data: bytes) -> None:
+    # Control 5: Secure File Metadata Storage
+    # Encrypted file contents are persisted separately (disk or blob storage) under `stored_name`.
+    # The database stores only metadata and a reference (`stored_name`) to the encrypted blob —
+    # plaintext file contents are NOT stored in the DB.
     """Save bytes either locally or to Azure blob storage depending on config."""
     if USE_AZURE_BLOBS and AZ_BLOB_CLIENT is not None:
         blob = AZ_BLOB_CLIENT.get_blob_client(container=AZ_BLOB_CONTAINER, blob=stored_name)
@@ -235,6 +242,8 @@ def init_db():
     c = conn.cursor()
 
     # Users
+    # Control 1: Unique User Identification
+    # The `users` table uses an integer PRIMARY KEY `id` and a UNIQUE constraint on `username`.
     c.execute('''
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,7 +254,10 @@ def init_db():
     )
     ''')
 
-    # Files owned by a user
+    # Control 5: Secure File Metadata Storage
+    # Files owned by a user — this metadata table stores filename (`orig_name`), size (`size`),
+    # owner (`owner_id`) and upload timestamp (`uploaded_at`). Encrypted contents are stored
+    # separately and referenced via `stored_name`.
     c.execute('''
     CREATE TABLE IF NOT EXISTS files(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -306,6 +318,9 @@ def init_db():
     conn.close()
 
 def add_file_record(orig_name, stored_name, mime, size, owner_id=None, client_encrypted: bool = False):
+    # Control 5: Secure File Metadata Storage
+    # This function inserts file metadata into the `files` table (orig_name, stored_name, mime, size,
+    # uploaded_at, owner_id). The actual encrypted bytes are written separately via `storage_save_bytes`.
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     ts = datetime.datetime.utcnow().isoformat()
@@ -395,6 +410,8 @@ def create_user(username: str, password: str, role: str = "user"):
     role = role.lower()
     if role not in ("user", "admin"):
         raise ValueError("Invalid role")
+    # Control 2: Password Security Enforcement
+    # Passwords are securely hashed with Argon2 (`ph.hash`) before storage; only `password_hash` is stored.
     pw_hash = ph.hash(password)
     now = datetime.datetime.utcnow().isoformat()
     conn = sqlite3.connect(DB_PATH)
@@ -458,18 +475,46 @@ def login():
     if request.method == 'POST':
         username = request.form['username'].strip()
         password = request.form['password']
+        # Control 4: Input Validation
+        # Reject empty or whitespace-only username/password early.
+        if not username:
+            flash("Username is required")
+            return redirect(url_for('login'))
+        if not password:
+            flash("Password is required")
+            return redirect(url_for('login'))
         row = get_user_by_username(username)
         if row is None:
+            # Control 3: Logging of authentication events
+            # LOGIN_FAIL: unknown username attempted
+            try:
+                app.logger.warning("LOGIN_FAIL username=%s user_id=%s ip=%s", username, None, request.remote_addr)
+            except Exception:
+                pass
             flash("Invalid username or password")
             return redirect(url_for('login'))
         user_id, uname, pw_hash, role, created_at = row
         try:
+            # Control 2: Password Security Enforcement
+            # Verify provided password against stored Argon2 hash (`pw_hash`) using `ph.verify`.
             ph.verify(pw_hash, password)
         except VerifyMismatchError:
+            # Control 3: Logging of authentication events
+            # LOGIN_FAIL: wrong password for existing user
+            try:
+                app.logger.warning("LOGIN_FAIL username=%s user_id=%s ip=%s", username, user_id, request.remote_addr)
+            except Exception:
+                pass
             flash("Invalid username or password")
             return redirect(url_for('login'))
         session.clear()
         session['user_id'] = user_id
+        # Control 3: Logging of authentication events
+        # LOGIN_SUCCESS: successful authentication
+        try:
+            app.logger.info("LOGIN_SUCCESS username=%s user_id=%s ip=%s", username, user_id, request.remote_addr)
+        except Exception:
+            pass
         flash("Logged in successfully.")
         return redirect(url_for('files'))
     return render_template('login.html')
@@ -493,8 +538,19 @@ def upload():
             flash("No selected file")
             return redirect(request.url)
 
-        orig_name = secure_filename(f.filename)
+        # Control 4: Input Validation
+        # Normalize filename and prevent path traversal. Reject suspicious filenames.
+        raw_filename = f.filename
+        if '..' in raw_filename or raw_filename.startswith('/') or '\\' in raw_filename:
+            flash("Invalid filename")
+            return redirect(request.url)
+        orig_name = secure_filename(raw_filename)
+
+        # Enforce max size as an extra guard (Flask may already enforce `MAX_CONTENT_LENGTH`).
         file_bytes = f.read()
+        if app.config.get('MAX_CONTENT_LENGTH') and len(file_bytes) > app.config.get('MAX_CONTENT_LENGTH'):
+            flash("File too large")
+            return redirect(request.url)
         mime = guess_mime(orig_name, file_bytes)
 
         # If the client already encrypted the file (browser-side), it should include a flag
@@ -518,6 +574,14 @@ def upload():
             with open(path, 'wb') as fh:
                 fh.write(enc_blob)
 
+        # Control 1: Unique User Identification
+        # The created file record stores the acting user's unique id in `files.owner_id`.
+        # Add a minimal log entry for traceability (user_id + filename) without changing behavior.
+        try:
+            app.logger.info("upload: user_id=%s filename=%s", g.user.get('id') if g.user else None, orig_name)
+        except Exception:
+            pass
+
         add_file_record(orig_name, stored_name, mime, len(file_bytes), g.user.get('id') if g.user else None, client_encrypted=client_encrypted)
         flash("Uploaded and encrypted successfully.")
         return redirect(url_for('files'))
@@ -532,6 +596,8 @@ def files():
 @app.route('/download/<int:file_id>')
 @login_required
 def download(file_id):
+    # Control 4: Input Validation
+    # `file_id` is enforced as int by Flask route converter. Further validation done via DB lookup.
     rec = get_file_record(file_id)
     if not rec:
         abort(404)
@@ -568,6 +634,8 @@ def download(file_id):
 @app.route('/preview/<int:file_id>')
 @login_required
 def preview(file_id):
+    # Control 4: Input Validation
+    # `file_id` is route-converted to int; DB lookup validates existence/ownership.
     rec = get_file_record(file_id)
     if not rec:
         abort(404)
@@ -596,6 +664,8 @@ def preview(file_id):
 @app.route('/delete/<int:file_id>', methods=['POST'])
 @login_required
 def delete(file_id):
+    # Control 4: Input Validation
+    # `file_id` is route-converted to int by Flask; DB enforces existence.
     # Only allow owner or admin to delete
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -618,6 +688,8 @@ def delete(file_id):
 @app.route('/share/<int:file_id>', methods=['POST'])
 @login_required
 def share_file(file_id):
+    # Control 4: Input Validation
+    # `file_id` is route-converted to int by Flask. `target_username` is trimmed and checked below.
     target_username = request.form.get('username', '').strip()
     message = request.form.get('message', '').strip()
     if not target_username:
@@ -775,6 +847,9 @@ def users():
             create_user(username, password, role)
         except ValueError as e:
             return {'error': str(e)}, 400
+        # Control 1: Unique User Identification
+        # Duplicate usernames are rejected by the DB UNIQUE constraint on `users.username`.
+        # This except block preserves existing behavior by returning an appropriate error.
         except sqlite3.IntegrityError:
             return {'error': 'Username already exists'}, 400
 
