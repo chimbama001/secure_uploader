@@ -301,6 +301,22 @@ def init_db():
     )
     ''')
 
+
+    # Audit log table for FR-20 (who did what, when)
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        action TEXT NOT NULL,
+        file_id INTEGER,
+        status TEXT NOT NULL,
+        ip_address TEXT,
+        user_agent TEXT,
+        created_at TEXT NOT NULL
+    )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -457,6 +473,32 @@ def user_can_access_file(user_id: int, file_id: int):
     conn.close()
     return shared
 
+def log_audit(action: str, status: str, file_id: int = None):
+    """
+    Records a security-relevant audit event for FR-20.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        ts = datetime.datetime.utcnow().isoformat()
+
+        user_id = g.user['id'] if g.user else None
+        username = g.user['username'] if g.user else None
+        ip_addr = request.remote_addr
+        user_agent = request.headers.get('User-Agent')
+
+        c.execute('''
+            INSERT INTO audit_log
+            (user_id, username, action, file_id, status, ip_address, user_agent, created_at)
+            VALUES (?,?,?,?,?,?,?,?)
+        ''', (user_id, username, action, file_id, status, ip_addr, user_agent, ts))
+
+        conn.commit()
+        conn.close()
+    except Exception:
+        # Audit logging must never break application flow
+        pass
+
 
 @app.route('/')
 def index():
@@ -549,8 +591,9 @@ def download(file_id):
     if not rec:
         abort(404)
 
-    # FR-5 Least Privilege: only owner, shared user, or admin
+    # FR-20 audit: denied download attempt
     if not user_can_access_file(g.user['id'], file_id) and g.user.get('role') != 'admin':
+        log_audit(action="download", status="DENIED", file_id=file_id)
         abort(403)
 
     try:
