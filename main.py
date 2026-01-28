@@ -731,6 +731,7 @@ def revoke_access(file_id, target_id):
 
 # ---- temp file APIs ----
 @app.route('/temp-upload', methods=['POST'])
+@login_required
 def temp_upload():
     if 'file' not in request.files:
         return {'error': 'No file part'}, 400
@@ -755,6 +756,7 @@ def temp_upload():
     }
 
 @app.route('/temp-file/<file_id>')
+@login_required
 def get_temp_file(file_id):
     if file_id not in TEMP_FILES:
         return {'error': 'File not found'}, 404
@@ -764,6 +766,7 @@ def get_temp_file(file_id):
                      mimetype=f['mime'])
 
 @app.route('/temp-file/<file_id>', methods=['DELETE'])
+@login_required
 def delete_temp_file(file_id):
     if file_id not in TEMP_FILES:
         return {'error': 'File not found'}, 404
