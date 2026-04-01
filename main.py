@@ -382,7 +382,7 @@ def page(title: str, body: str):
 # =============================================================================
 @app.route("/")
 def home():
-    body = """
+    body = render_template_string("""
     <div class="text-center">
       <h1 class="h3">Secure Uploader</h1>
       <p class="text-muted">Encrypt files on upload and store them securely in Azure Blob Storage.</p>
@@ -394,7 +394,7 @@ def home():
         {% endif %}
       </div>
     </div>
-    """
+    """)
     return page("Home", body)
 
 @app.route("/login", methods=["GET", "POST"])
@@ -425,7 +425,7 @@ def login():
         flash("Logged in successfully.")
         return redirect(url_for("files"))
 
-    body = """
+    body = render_template_string("""
     <div class="row justify-content-center">
       <div class="col-md-6">
         <div class="card shadow-sm">
@@ -450,7 +450,7 @@ def login():
         </div>
       </div>
     </div>
-    """
+    """, signup_enabled=SIGNUP_ENABLED)
     return render_template_string(BASE, title="Login", body=body, signup_enabled=SIGNUP_ENABLED)
 
 @app.route("/signup", methods=["GET", "POST"])
@@ -636,7 +636,7 @@ def upload():
             return redirect(url_for("upload"))
 
         client_encrypted = bool(request.form.get("client_encrypted"))
-        blob_data = file_bytes if client_encrypted else encrypt_bytes(file_bytes)
+        blob_data = file_bytes if client_encrypted else encrypt_bytes(file_bytes, ENC_KEY_B64)
 
         stored_name = f"{uuid.uuid4().hex}.bin"
 
@@ -1152,7 +1152,7 @@ def download(file_id: int):
         abort(404)
 
     if not client_encrypted:
-        data = decrypt_bytes(data)
+        data = decrypt_bytes(data, ENC_KEY_B64)
 
     return send_file(
         io.BytesIO(data),
