@@ -36,3 +36,16 @@ dist/
 
 # Logs
 *.log
+.upload_enc_key
+.env
+.venv/
+__pycache__/
+files.db
+*.bak.*
+
+.upload_enc_key
+.env
+.venv/
+__pycache__/
+files.db
+*.bak.*

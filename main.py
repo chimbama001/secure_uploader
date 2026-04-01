@@ -1,4 +1,3 @@
-# main.py (SQLite-first, schema-safe)
 import os
 import re
 import io
@@ -8,22 +7,24 @@ import datetime
 from pathlib import Path
 from functools import wraps
 
+from dotenv import load_dotenv
 from flask import (
-    Flask, request, redirect, url_for, render_template_string,
-    flash, session, g, send_file, abort
+    Flask,
+    request,
+    redirect,
+    url_for,
+    render_template_string,
+    flash,
+    session,
+    g,
+    send_file,
+    abort,
 )
 from werkzeug.utils import secure_filename
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+from azure.storage.blob import BlobServiceClient
 
-# Optional dotenv
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ModuleNotFoundError:
-    pass
-
-# Optional limiter (kept minimal, safe defaults)
 try:
     from flask_limiter import Limiter
     from flask_limiter.util import get_remote_address
@@ -31,33 +32,91 @@ except Exception:
     Limiter = None
     get_remote_address = None
 
+from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
 # ---- crypto utils (your existing module) ----
 from crypto_utils import encrypt_bytes, decrypt_bytes
 from backup_utils import BACKUP_ENCRYPTION_METHOD, create_protected_backup, load_backup_key
 
 
 # =============================================================================
-# App config
+# Environment / config
 # =============================================================================
-app = Flask(__name__)
+load_dotenv("/home/secureuploader/secure_uploader/.env")
 
-# Use a stable secret in env for sessions; fallback is OK for local testing.
+app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
 ENV = os.environ.get("FLASK_ENV", "development").lower()
 secure_cookies = ENV == "production"
+
 app.config.update(
     SESSION_COOKIE_SECURE=secure_cookies,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=200 * 1024 * 1024,
 )
 
-# Rate limiting (optional)
+SIGNUP_ENABLED = os.getenv("SIGNUP_ENABLED", "false").lower() == "true"
+SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
+
+DATA_DIR = os.environ.get("DATA_DIR") or "/home/secureuploader/secure_uploader"
+DATA_DIR = os.path.abspath(DATA_DIR)
+DB_PATH = os.path.join(DATA_DIR, "files.db")
+
+ph = PasswordHasher()
+
 if Limiter and get_remote_address:
-    limiter = Limiter(app, key_func=get_remote_address, default_limits=["200 per hour"])
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,
+        default_limits=["500 per hour"],
+    )
 else:
     limiter = None
 
+if limiter:
+    login_limit = limiter.limit("5 per 10 seconds")
+    signup_limit = limiter.limit("3 per 10 seconds")
+else:
+    def login_limit(f):
+        return f
+    def signup_limit(f):
+        return f
+
+# =============================================================================
+# Blob Storage
+# =============================================================================
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "securevault-files")
+
+if not AZURE_STORAGE_CONNECTION_STRING:
+    raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not set")
+
+blob_service_client = BlobServiceClient.from_connection_string(
+    AZURE_STORAGE_CONNECTION_STRING
+)
+container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER)
+
+def upload_blob_bytes(blob_name: str, data: bytes) -> None:
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.upload_blob(data, overwrite=True)
+
+def download_blob_bytes(blob_name: str) -> bytes:
+    blob_client = container_client.get_blob_client(blob_name)
+    return blob_client.download_blob().readall()
+
+def delete_blob_bytes(blob_name: str) -> None:
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.delete_blob(delete_snapshots="include")
+
+def blob_exists(blob_name: str) -> bool:
+    blob_client = container_client.get_blob_client(blob_name)
+    return blob_client.exists()
+
+# =============================================================================
+# Encryption key
+# =============================================================================
+ENC_KEY_B64 = load_key_from_env(os.environ.get("UPLOAD_ENC_KEY"))
 ph = PasswordHasher()
 
 # Data directory (persistent)
@@ -80,7 +139,7 @@ ENC_KEY_B64 = load_backup_key()
 
 
 # =============================================================================
-# DB helpers (schema-safe)
+# DB helpers
 # =============================================================================
 def db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -97,11 +156,9 @@ def ensure_column(conn, table: str, column: str, ddl: str):
 
 
 def ensure_schema():
-    """Create/upgrade schema to match the app's expectations."""
     conn = db_connect()
     c = conn.cursor()
 
-    # USERS
     c.execute("""
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,11 +169,10 @@ def ensure_schema():
     );
     """)
 
-    # FILES (canonical schema)
     c.execute("""
     CREATE TABLE IF NOT EXISTS files (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      filename TEXT NOT NULL,              -- required legacy-friendly column
+      filename TEXT NOT NULL,
       orig_name TEXT,
       stored_name TEXT NOT NULL,
       mime TEXT,
@@ -127,7 +183,6 @@ def ensure_schema():
     );
     """)
 
-    # FILE ACCESS (optional sharing)
     c.execute("""
     CREATE TABLE IF NOT EXISTS file_access (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,13 +250,10 @@ def ensure_schema():
     conn.commit()
     conn.close()
 
-
-# Run schema check on import
 ensure_schema()
 
-
 # =============================================================================
-# Auth helpers
+# Helpers
 # =============================================================================
 PASSWORD_REGEX = re.compile(
     r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&#^])[A-Za-z\d@$!%*?&#^]{12,}$'
@@ -212,6 +264,8 @@ INCIDENT_STATUSES = ("open", "investigating", "resolved")
 def validate_password_complexity(pw: str) -> bool:
     return bool(PASSWORD_REGEX.match(pw))
 
+def valid_password(pw: str) -> bool:
+    return validate_password_complexity(pw)
 
 def login_required(view_func):
     @wraps(view_func)
@@ -222,7 +276,6 @@ def login_required(view_func):
         return view_func(*args, **kwargs)
     return wrapped
 
-
 @app.before_request
 def load_user():
     g.user = None
@@ -230,11 +283,13 @@ def load_user():
     if not uid:
         return
     conn = db_connect()
-    row = conn.execute("SELECT id, username, role FROM users WHERE id=?", (uid,)).fetchone()
+    row = conn.execute(
+        "SELECT id, username, role FROM users WHERE id=?",
+        (uid,)
+    ).fetchone()
     conn.close()
     if row:
         g.user = dict(row)
-
 
 def is_admin():
     return bool(g.user) and g.user.get("role") == "admin"
@@ -266,7 +321,7 @@ def get_incident_actions(incident_ids):
 
 
 # =============================================================================
-# Minimal HTML templates (no external template files required)
+# Templates
 # =============================================================================
 BASE = """
 <!doctype html>
@@ -286,14 +341,19 @@ BASE = """
         <span class="text-white me-3">Hi, {{g.user.username}}</span>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('files') }}">Files</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('upload') }}">Upload</a>
+        {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('incidents') }}">Incidents</a>
         {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('backups') }}">Backups</a>
         {% endif %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('add_user') }}">Add User</a>
+        {% endif %}
         <a class="btn btn-sm btn-warning" href="{{ url_for('logout') }}">Logout</a>
       {% else %}
-        <a class="btn btn-sm btn-outline-light" href="{{ url_for('login') }}">Login</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('login') }}">Login</a>
+        {% if signup_enabled %}
+        <a class="btn btn-sm btn-light" href="{{ url_for('signup') }}">Sign Up</a>
+        {% endif %}
       {% endif %}
     </div>
   </div>
@@ -314,6 +374,8 @@ BASE = """
 </html>
 """
 
+def page(title: str, body: str):
+    return render_template_string(BASE, title=title, body=body, signup_enabled=SIGNUP_ENABLED)
 
 # =============================================================================
 # Routes
@@ -323,28 +385,36 @@ def home():
     body = """
     <div class="text-center">
       <h1 class="h3">Secure Uploader</h1>
-      <p class="text-muted">CUI-focused demo vault: encryption + access control + audit-friendly metadata.</p>
+      <p class="text-muted">Encrypt files on upload and store them securely in Azure Blob Storage.</p>
       <div class="d-flex justify-content-center gap-2">
         <a class="btn btn-primary" href="/upload">Upload</a>
         <a class="btn btn-outline-primary" href="/files">View Files</a>
+        {% if g.user and g.user.role == 'admin' %}
         <a class="btn btn-outline-secondary" href="/add-user">Add User</a>
+        {% endif %}
       </div>
     </div>
     """
-    return render_template_string(BASE, title="Home", body=body)
-
+    return page("Home", body)
 
 @app.route("/login", methods=["GET", "POST"])
+@login_limit
 def login():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
+
         conn = db_connect()
-        row = conn.execute("SELECT id, password_hash FROM users WHERE username=?", (username,)).fetchone()
+        row = conn.execute(
+            "SELECT id, password_hash FROM users WHERE username=?",
+            (username,)
+        ).fetchone()
         conn.close()
+
         if not row:
             flash("Invalid username or password.")
             return redirect(url_for("login"))
+
         try:
             ph.verify(row["password_hash"], password)
         except VerifyMismatchError:
@@ -352,6 +422,7 @@ def login():
             return redirect(url_for("login"))
 
         session["user_id"] = row["id"]
+        flash("Logged in successfully.")
         return redirect(url_for("files"))
 
     body = """
@@ -370,14 +441,102 @@ def login():
                 <input class="form-control" type="password" name="password" required>
               </div>
               <button class="btn btn-primary">Log in</button>
+              <a class="btn btn-link" href="/">Home</a>
+              {% if signup_enabled %}
+              <a class="btn btn-link" href="/signup">Sign Up</a>
+              {% endif %}
             </form>
           </div>
         </div>
       </div>
     </div>
     """
-    return render_template_string(BASE, title="Login", body=body)
+    return render_template_string(BASE, title="Login", body=body, signup_enabled=SIGNUP_ENABLED)
 
+@app.route("/signup", methods=["GET", "POST"])
+@signup_limit
+def signup():
+    if not SIGNUP_ENABLED:
+        abort(404)
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        confirm = request.form.get("confirm") or ""
+        signup_code = (request.form.get("signup_code") or "").strip()
+
+        if not username or not password or not confirm or not signup_code:
+            flash("All fields are required.")
+            return redirect(url_for("signup"))
+
+        if password != confirm:
+            flash("Passwords do not match.")
+            return redirect(url_for("signup"))
+
+        if not valid_password(password):
+            flash("Password must be 12+ chars with upper, lower, number, and special character.")
+            return redirect(url_for("signup"))
+
+        if not SIGNUP_CODE or signup_code != SIGNUP_CODE:
+            flash("Invalid signup code.")
+            return redirect(url_for("signup"))
+
+        conn = db_connect()
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username=?",
+            (username,)
+        ).fetchone()
+
+        if existing:
+            conn.close()
+            flash("Username already exists.")
+            return redirect(url_for("signup"))
+
+        password_hash = ph.hash(password)
+        conn.execute(
+            "INSERT INTO users(username, password_hash, role, created_at) VALUES (?,?,?,?)",
+            (username, password_hash, "user", datetime.datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+
+        flash("Account created successfully. Please log in.")
+        return redirect(url_for("login"))
+
+    body = """
+    <div class="row justify-content-center">
+      <div class="col-md-6">
+        <div class="card shadow-sm">
+          <div class="card-body">
+            <h3 class="card-title">Sign Up</h3>
+            <p class="text-muted">Create a standard user account.</p>
+            <form method="post">
+              <div class="mb-3">
+                <label class="form-label">Username</label>
+                <input class="form-control" name="username" required>
+              </div>
+              <div class="mb-3">
+                <label class="form-label">Password</label>
+                <input class="form-control" type="password" name="password" required>
+                <div class="form-text">12+ chars, upper/lower/number/special.</div>
+              </div>
+              <div class="mb-3">
+                <label class="form-label">Confirm Password</label>
+                <input class="form-control" type="password" name="confirm" required>
+              </div>
+              <div class="mb-3">
+                <label class="form-label">Signup Code</label>
+                <input class="form-control" name="signup_code" required>
+              </div>
+              <button class="btn btn-primary">Create Account</button>
+              <a class="btn btn-link" href="/login">Login</a>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+    return page("Sign Up", body)
 
 @app.route("/logout")
 def logout():
@@ -385,10 +544,8 @@ def logout():
     flash("Logged out.")
     return redirect(url_for("home"))
 
-
 @app.route("/add-user", methods=["GET", "POST"])
 def add_user():
-    # Allow first user creation without auth, then require admin afterwards
     conn = db_connect()
     user_count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
     conn.close()
@@ -401,14 +558,16 @@ def add_user():
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         role = (request.form.get("role") or "user").strip().lower()
+
         if role not in ("user", "admin"):
             role = "user"
 
-        if not validate_password_complexity(password):
+        if not valid_password(password):
             flash("Password must be 12+ chars and include upper/lower/number/special.")
             return redirect(url_for("add_user"))
 
         pw_hash = ph.hash(password)
+
         conn = db_connect()
         try:
             conn.execute(
@@ -417,8 +576,8 @@ def add_user():
             )
             conn.commit()
         except sqlite3.IntegrityError:
-            flash("Username already exists.")
             conn.close()
+            flash("Username already exists.")
             return redirect(url_for("add_user"))
         conn.close()
 
@@ -431,7 +590,7 @@ def add_user():
         <div class="card shadow-sm">
           <div class="card-body">
             <h3 class="card-title">Add User</h3>
-            <p class="text-muted">For demo: first user can be admin. After that, admin-only.</p>
+            <p class="text-muted">First user can be admin. After that, admin only.</p>
             <form method="post">
               <div class="mb-3">
                 <label class="form-label">Username</label>
@@ -457,8 +616,7 @@ def add_user():
       </div>
     </div>
     """
-    return render_template_string(BASE, title="Add User", body=body)
-
+    return page("Add User", body)
 
 @app.route("/upload", methods=["GET", "POST"])
 @login_required
@@ -472,21 +630,21 @@ def upload():
         orig_name = secure_filename(f.filename)
         mime = f.mimetype or "application/octet-stream"
         file_bytes = f.read()
+
         if not file_bytes:
             flash("Empty upload.")
             return redirect(url_for("upload"))
 
         client_encrypted = bool(request.form.get("client_encrypted"))
-        # If client encrypted, store bytes as-is; otherwise encrypt server-side
-        if client_encrypted:
-            blob = file_bytes
-        else:
-            blob = encrypt_bytes(file_bytes)
+        blob_data = file_bytes if client_encrypted else encrypt_bytes(file_bytes)
 
         stored_name = f"{uuid.uuid4().hex}.bin"
-        path = os.path.join(app.config["UPLOAD_DIR"], stored_name)
-        with open(path, "wb") as out:
-            out.write(blob)
+
+        try:
+            upload_blob_bytes(stored_name, blob_data)
+        except Exception as e:
+            flash(f"Blob upload failed: {e}")
+            return redirect(url_for("upload"))
 
         conn = db_connect()
         conn.execute(
@@ -495,14 +653,14 @@ def upload():
             VALUES (?,?,?,?,?,?,?,?)
             """,
             (
-                orig_name,           # filename (NOT NULL)
-                orig_name,           # orig_name
+                orig_name,
+                orig_name,
                 stored_name,
                 mime,
                 len(file_bytes),
                 datetime.datetime.utcnow().isoformat(),
                 int(g.user["id"]),
-                1 if client_encrypted else 0
+                1 if client_encrypted else 0,
             )
         )
         conn.commit()
@@ -536,33 +694,31 @@ def upload():
       </div>
     </div>
     """
-    return render_template_string(BASE, title="Upload", body=body)
-
+    return page("Upload", body)
 
 @app.route("/files")
 @login_required
 def files():
     uid = int(g.user["id"])
     conn = db_connect()
-    # Owner can see their files; admin sees all
+
     if is_admin():
         rows = conn.execute(
-            "SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted "
-            "FROM files ORDER BY uploaded_at DESC"
+            "SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted FROM files ORDER BY uploaded_at DESC"
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted "
-            "FROM files WHERE owner_id=? ORDER BY uploaded_at DESC",
+            "SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted FROM files WHERE owner_id=? ORDER BY uploaded_at DESC",
             (uid,)
         ).fetchall()
+
     conn.close()
 
-    # Render
     lines = []
     lines.append("<h3>Your Files</h3>")
     lines.append("<div class='table-responsive'><table class='table table-striped'>")
     lines.append("<thead><tr><th>Name</th><th>Size</th><th>Uploaded</th><th>Encrypted</th><th>Actions</th></tr></thead><tbody>")
+
     for r in rows:
         name = r["orig_name"] or r["filename"] or "unknown"
         enc = "Client" if int(r["client_encrypted"]) == 1 else "Server"
@@ -578,8 +734,10 @@ def files():
             f"</td>"
             "</tr>"
         )
+
     lines.append("</tbody></table></div>")
     body = "\n".join(lines)
+    return page("Files", body)
     return render_template_string(BASE, title="Files", body=body)
 
 
@@ -971,15 +1129,12 @@ def download_backup(backup_id: int):
 @login_required
 def download(file_id: int):
     conn = db_connect()
-    row = conn.execute(
-        "SELECT * FROM files WHERE id=?",
-        (file_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
     conn.close()
+
     if not row:
         abort(404)
 
-    # Authorization: owner or admin
     uid = int(g.user["id"])
     if not is_admin() and int(row["owner_id"]) != uid:
         abort(403)
@@ -988,26 +1143,29 @@ def download(file_id: int):
     orig_name = row["orig_name"] or row["filename"] or "download.bin"
     client_encrypted = int(row["client_encrypted"]) == 1
 
-    path = os.path.join(app.config["UPLOAD_DIR"], stored_name)
-    if not os.path.exists(path):
+    if not blob_exists(stored_name):
         abort(404)
 
-    data = Path(path).read_bytes()
+    try:
+        data = download_blob_bytes(stored_name)
+    except Exception:
+        abort(404)
+
     if not client_encrypted:
         data = decrypt_bytes(data)
 
     return send_file(
         io.BytesIO(data),
         as_attachment=True,
-        download_name=orig_name
+        download_name=orig_name,
     )
-
 
 @app.route("/delete/<int:file_id>")
 @login_required
 def delete(file_id: int):
     conn = db_connect()
     row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+
     if not row:
         conn.close()
         abort(404)
@@ -1017,11 +1175,11 @@ def delete(file_id: int):
         conn.close()
         abort(403)
 
-    # delete file bytes
-    path = os.path.join(app.config["UPLOAD_DIR"], row["stored_name"])
+    stored_name = row["stored_name"]
+
     try:
-        if os.path.exists(path):
-            os.remove(path)
+        if blob_exists(stored_name):
+            delete_blob_bytes(stored_name)
     except Exception:
         pass
 
@@ -1032,7 +1190,6 @@ def delete(file_id: int):
     flash("Deleted.")
     return redirect(url_for("files"))
 
-
 if __name__ == "__main__":
-    # For demo only; use gunicorn in production
     app.run(host="0.0.0.0", port=8000, debug=(ENV != "production"))
+ 

@@ -1723,7 +1723,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    run_host = os.environ.get("FLASK_RUN_HOST", os.environ.get("HOST", "127.0.0.1"))
+    run_host = os.environ.get("FLASK_RUN_HOST", os.environ.get("HOST", "0.0.0.0"))
     run_port = int(os.environ.get("PORT", 5000))
     run_debug = (os.environ.get("FLASK_DEBUG", "1").lower() in ("1", "true", "yes")) and not IS_PROD
 
