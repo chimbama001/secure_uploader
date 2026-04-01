@@ -1,13 +1,21 @@
 # Virtual environment
 .venv/
 venv/
+env/
+ENV/
 
 # Local environment variables
 .env
 .env.*
+.envrc
 
 # Encrypted uploaded files
 uploads/
+
+# Secrets / runtime data
+.upload_enc_key
+kdf_salt.bin
+files.db
 
 # Python cache
 __pycache__/
@@ -15,13 +23,16 @@ __pycache__/
 *.pyo
 *.pyd
 
-# SQLite DB (optional - if you don’t want to share stored file history)
-files.db
+# Build / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
 
-.venv/
-uploads/
-.env
-.env.*
-__pycache__/
-*.pyc
-files.db
+# VS / IDE
+.vs/
+.vscode/
+.idea/
+
+# Logs
+*.log

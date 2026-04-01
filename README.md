@@ -24,4 +24,4 @@ This system is developed **for academic purposes only** and does **NOT** represe
 Azure CLI → SSH → Git Pull → Run → Test
 
 ## Status
-🚧 Project initialization phase (solo execution)
+🚧 Project initialization phase 
