@@ -57,7 +57,7 @@ app.config.update(
 )
 
 SIGNUP_ENABLED = os.getenv("SIGNUP_ENABLED", "false").lower() == "true"
-5SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
+SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
 
 DATA_DIR = os.environ.get("DATA_DIR") or "/home/secureuploader/secure_uploader"
 DATA_DIR = os.path.abspath(DATA_DIR)
