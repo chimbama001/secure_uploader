@@ -47,17 +47,17 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
 ENV = os.environ.get("FLASK_ENV", "development").lower()
-secure_cookies = ENV == "production"
+secure_cookies = False
 
 app.config.update(
-    SESSION_COOKIE_SECURE=secure_cookies,
+    SESSION_COOKIE_SECURE=False,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     MAX_CONTENT_LENGTH=200 * 1024 * 1024,
 )
 
 SIGNUP_ENABLED = os.getenv("SIGNUP_ENABLED", "false").lower() == "true"
-SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
+5SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
 
 DATA_DIR = os.environ.get("DATA_DIR") or "/home/secureuploader/secure_uploader"
 DATA_DIR = os.path.abspath(DATA_DIR)
