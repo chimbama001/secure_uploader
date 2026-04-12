@@ -740,7 +740,11 @@ def files():
             f"<td>{enc}</td>"
             f"<td>"
             f"<a class='btn btn-sm btn-outline-primary me-2' href='/download/{r['id']}'>Download</a>"
-            f"<a class='btn btn-sm btn-outline-danger' href='/delete/{r['id']}'>Delete</a>"
+            f"<a class='btn btn-sm btn-outline-danger me-2' href='/delete/{r['id']}'>Delete</a>"
+            f"<form method='post' action='/share/{r['id']}' style='display:inline;'>"
+            f"<input name='username' placeholder='username' style='width:120px;font-size:12px;'>"
+            f"<button class='btn btn-sm btn-outline-secondary'>Share</button>"
+            f"</form>"
             f"</td>"
             "</tr>"
         )
