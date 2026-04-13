@@ -8,6 +8,8 @@ from pathlib import Path
 from functools import wraps
 
 from dotenv import load_dotenv
+load_dotenv(override=True)
+
 from flask import (
     Flask,
     request,
@@ -432,20 +434,92 @@ def page(title: str, body: str):
 # =============================================================================
 @app.route("/")
 def home():
-    body = render_template_string("""
-    <div class="text-center">
-      <h1 class="h3">Secure Uploader</h1>
-      <p class="text-muted">Encrypt files on upload and store them securely in Azure Blob Storage.</p>
-      <div class="d-flex justify-content-center gap-2">
-        <a class="btn btn-primary" href="/upload">Upload</a>
-        <a class="btn btn-outline-primary" href="/files">View Files</a>
-        {% if g.user and g.user.role == 'admin' %}
-        <a class="btn btn-outline-secondary" href="/add-user">Add User</a>
-        {% endif %}
+    if not session.get("seen_onboarding"):
+        return redirect("/onboarding")
+
+    admin_button = ""
+    if g.user and g.user.get("role") == "admin":
+        admin_button = "<a class='btn btn-secondary' href='/add-user'>Add User</a> <a class='btn btn-dark' href='/audit-logs'>Audit Logs</a>"
+
+    body = f"""
+    <h2>Secure Uploader</h2>
+    <p>Authenticated access is required before protected resources are available.</p>
+    <a class='btn btn-primary' href='/upload'>Upload</a>
+    <a class='btn btn-secondary' href='/files'>View Files</a>
+    {admin_button}
+    """
+    return page("Home", body)
+
+@app.route("/onboarding")
+def onboarding():
+    if session.get("seen_onboarding"):
+        return redirect(url_for("files"))
+
+    body = """
+    <style>
+    .onboard-card {
+        background: rgba(255, 255, 255, 0.15);
+        backdrop-filter: blur(12px);
+        border-radius: 20px;
+        padding: 40px;
+        max-width: 700px;
+        margin: auto;
+        color: #000;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+    }
+    .carousel-item {
+        min-height: 300px;
+    }
+    </style>
+
+    <div class="d-flex justify-content-center align-items-center" style="height:70vh;">
+      <div id="onboardingCarousel" class="carousel slide w-100" data-bs-ride="carousel">
+        <div class="carousel-inner text-center">
+
+          <div class="carousel-item active">
+            <div class="onboard-card">
+              <h2>Welcome to SecureVault 🔐</h2>
+              <p>Create an account or log in to begin using the platform securely.</p>
+              <p><b>Step 1:</b> Sign up and authenticate to access your workspace.</p>
+            </div>
+          </div>
+
+          <div class="carousel-item">
+            <div class="onboard-card">
+              <h2>Upload Files Securely 📤</h2>
+              <p>Upload images and files through a protected interface.</p>
+              <p><b>Step 2:</b> Files are encrypted before storage.</p>
+            </div>
+          </div>
+
+          <div class="carousel-item">
+            <div class="onboard-card">
+              <h2>Share & Download 📥</h2>
+              <p>Access your uploaded files securely anytime.</p>
+              <p><b>Step 3:</b> Controlled and authorized access only.</p>
+              <a href="/finish-onboarding" class="btn btn-primary mt-3">Get Started</a>
+            </div>
+          </div>
+
+        </div>
+
+        <button class="carousel-control-prev" type="button" data-bs-target="#onboardingCarousel" data-bs-slide="prev">
+          <span class="carousel-control-prev-icon"></span>
+        </button>
+
+        <button class="carousel-control-next" type="button" data-bs-target="#onboardingCarousel" data-bs-slide="next">
+          <span class="carousel-control-next-icon"></span>
+        </button>
       </div>
     </div>
-    """)
-    return page("Home", body)
+    """
+    return page("Welcome", body)
+
+@app.route("/finish-onboarding")
+def finish_onboarding():
+    session["seen_onboarding"] = True
+    return redirect("/signup")
+
 
 @app.route("/login", methods=["GET", "POST"])
 @login_limit
@@ -473,6 +547,8 @@ def login():
 
         session["user_id"] = row["id"]
         flash("Logged in successfully.")
+        if not session.get("seen_onboarding"):
+              return redirect(url_for("onboarding"))
         return redirect(url_for("files"))
 
     body = render_template_string("""
