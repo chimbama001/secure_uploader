@@ -38,6 +38,40 @@ from crypto_utils import encrypt_bytes, decrypt_bytes
 from backup_utils import BACKUP_ENCRYPTION_METHOD, create_protected_backup, load_backup_key
 
 
+def log_event(user_id, username, action, target=None, status="SUCCESS", metadata=None):
+    import sqlite3
+    import json
+    from datetime import datetime
+
+    try:
+        conn = sqlite3.connect("files.db")
+        conn.row_factory = sqlite3.Row
+
+        conn.execute(
+            """
+            INSERT INTO audit_log
+            (user_id, username, action, target, status, metadata, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                action,
+                target,
+                status,
+                json.dumps(metadata) if metadata else None,
+                datetime.utcnow().isoformat()
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        print("Audit logging failed:", e)
+
+
+
 # =============================================================================
 # Environment / config
 # =============================================================================
