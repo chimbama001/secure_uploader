@@ -82,6 +82,9 @@ load_dotenv("/home/secureuploader/secure_uploader/.env")
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
+from datetime import timedelta
+app.permanent_session_lifetime = timedelta(minutes=15)
+
 ENV = os.environ.get("FLASK_ENV", "development").lower()
 secure_cookies = False
 
@@ -545,6 +548,7 @@ def login():
             flash("Invalid username or password.")
             return redirect(url_for("login"))
 
+        session.permanent = True
         session["user_id"] = row["id"]
         flash("Logged in successfully.")
         if not session.get("seen_onboarding"):

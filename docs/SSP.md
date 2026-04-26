@@ -109,3 +109,17 @@ April 2026
 
 Next Scheduled Review:
 April 2027
+
+
+
+## Session Termination Policy (AC.L2-3.1.11)
+
+SecureVault automatically terminates user sessions after 15 minutes of inactivity.
+
+Session timeout enforcement is implemented using Flask session lifetime configuration:
+
+- permanent session enabled after authentication
+- inactivity timeout set to 15 minutes
+- session termination requires re-authentication
+
+This mechanism prevents unauthorized access from unattended authenticated sessions and supports compliance with CMMC Level 2 control AC.L2-3.1.11.
