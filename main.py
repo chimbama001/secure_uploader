@@ -281,6 +281,63 @@ def ensure_schema():
     );
     """)
 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS vulnerability_records (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'medium',
+      description TEXT,
+      remediation_plan TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      owner TEXT,
+      date_identified TEXT,
+      date_remediated TEXT,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS control_assessments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      control_id TEXT NOT NULL,
+      control_name TEXT NOT NULL,
+      result TEXT NOT NULL,
+      evidence_notes TEXT,
+      assessed_by TEXT,
+      assessment_date TEXT,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS recovery_plans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recovery_objective TEXT NOT NULL,
+      backup_location TEXT,
+      recovery_steps TEXT,
+      responsible_role TEXT,
+      last_reviewed_date TEXT,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS contingency_tests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_name TEXT NOT NULL,
+      test_date TEXT,
+      scenario_tested TEXT,
+      result TEXT,
+      issues_found TEXT,
+      follow_up_actions TEXT,
+      created_by INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    """)
+
     ensure_column(
         conn,
         "backup_records",
@@ -398,6 +455,7 @@ BASE = """
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('upload') }}">Upload</a>
         {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('incidents') }}">Incidents</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('security_compliance') }}">Security Compliance Center</a>
         {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('backups') }}">Backups</a>
         {% endif %}
@@ -1098,6 +1156,333 @@ def handle_incident(incident_id: int):
 
     flash("Incident response action logged.")
     return redirect(url_for("incidents"))
+
+
+@app.route("/security-compliance", methods=["GET", "POST"])
+@login_required
+def security_compliance():
+    if not is_admin():
+        abort(403)
+
+    if request.method == "POST":
+        record_type = (request.form.get("record_type") or "").strip()
+        now = datetime.datetime.utcnow().isoformat()
+        conn = db_connect()
+        audit_ready = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'"
+        ).fetchone() is not None
+
+        if record_type == "vulnerability":
+            title = (request.form.get("title") or "").strip()
+            if not title:
+                conn.close()
+                flash("Vulnerability title is required.")
+                return redirect(url_for("security_compliance"))
+            conn.execute(
+                """
+                INSERT INTO vulnerability_records
+                (title, severity, description, remediation_plan, status, owner,
+                 date_identified, date_remediated, created_by, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    title,
+                    (request.form.get("severity") or "medium").strip(),
+                    (request.form.get("description") or "").strip(),
+                    (request.form.get("remediation_plan") or "").strip(),
+                    (request.form.get("status") or "open").strip(),
+                    (request.form.get("owner") or "").strip(),
+                    (request.form.get("date_identified") or "").strip(),
+                    (request.form.get("date_remediated") or "").strip(),
+                    int(g.user["id"]),
+                    now,
+                )
+            )
+            flash("Vulnerability remediation record added.")
+            audit_action = "compliance_vulnerability_create"
+            audit_target = title
+
+        elif record_type == "assessment":
+            control_id = (request.form.get("control_id") or "").strip()
+            control_name = (request.form.get("control_name") or "").strip()
+            result = (request.form.get("result") or "").strip()
+            if not control_id or not control_name or not result:
+                conn.close()
+                flash("Control ID, control name, and result are required.")
+                return redirect(url_for("security_compliance"))
+            conn.execute(
+                """
+                INSERT INTO control_assessments
+                (control_id, control_name, result, evidence_notes, assessed_by,
+                 assessment_date, created_by, created_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    control_id,
+                    control_name,
+                    result,
+                    (request.form.get("evidence_notes") or "").strip(),
+                    (request.form.get("assessed_by") or "").strip(),
+                    (request.form.get("assessment_date") or "").strip(),
+                    int(g.user["id"]),
+                    now,
+                )
+            )
+            flash("Security control assessment added.")
+            audit_action = "compliance_assessment_create"
+            audit_target = control_id
+
+        elif record_type == "recovery":
+            recovery_objective = (request.form.get("recovery_objective") or "").strip()
+            if not recovery_objective:
+                conn.close()
+                flash("Recovery objective is required.")
+                return redirect(url_for("security_compliance"))
+            conn.execute(
+                """
+                INSERT INTO recovery_plans
+                (recovery_objective, backup_location, recovery_steps,
+                 responsible_role, last_reviewed_date, created_by, created_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    recovery_objective,
+                    (request.form.get("backup_location") or "").strip(),
+                    (request.form.get("recovery_steps") or "").strip(),
+                    (request.form.get("responsible_role") or "").strip(),
+                    (request.form.get("last_reviewed_date") or "").strip(),
+                    int(g.user["id"]),
+                    now,
+                )
+            )
+            flash("Recovery planning record added.")
+            audit_action = "compliance_recovery_create"
+            audit_target = recovery_objective
+
+        elif record_type == "contingency":
+            test_name = (request.form.get("test_name") or "").strip()
+            if not test_name:
+                conn.close()
+                flash("Contingency test name is required.")
+                return redirect(url_for("security_compliance"))
+            conn.execute(
+                """
+                INSERT INTO contingency_tests
+                (test_name, test_date, scenario_tested, result, issues_found,
+                 follow_up_actions, created_by, created_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    test_name,
+                    (request.form.get("test_date") or "").strip(),
+                    (request.form.get("scenario_tested") or "").strip(),
+                    (request.form.get("result") or "").strip(),
+                    (request.form.get("issues_found") or "").strip(),
+                    (request.form.get("follow_up_actions") or "").strip(),
+                    int(g.user["id"]),
+                    now,
+                )
+            )
+            flash("Contingency plan test record added.")
+            audit_action = "compliance_contingency_create"
+            audit_target = test_name
+
+        else:
+            conn.close()
+            flash("Invalid compliance record type.")
+            return redirect(url_for("security_compliance"))
+
+        conn.commit()
+        conn.close()
+
+        if audit_ready:
+            log_event(
+                g.user["id"],
+                g.user["username"],
+                audit_action,
+                audit_target,
+                "SUCCESS",
+                {"record_type": record_type},
+            )
+        return redirect(url_for("security_compliance"))
+
+    conn = db_connect()
+    vulnerabilities = conn.execute(
+        "SELECT * FROM vulnerability_records ORDER BY created_at DESC"
+    ).fetchall()
+    assessments = conn.execute(
+        "SELECT * FROM control_assessments ORDER BY created_at DESC"
+    ).fetchall()
+    recovery_plans = conn.execute(
+        "SELECT * FROM recovery_plans ORDER BY created_at DESC"
+    ).fetchall()
+    contingency_tests = conn.execute(
+        "SELECT * FROM contingency_tests ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+
+    body = render_template_string(
+        """
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div>
+            <h3 class="mb-1">Security Compliance Center</h3>
+            <p class="text-muted mb-0">Admin records for remediation, assessments, recovery planning, and contingency test evidence.</p>
+          </div>
+        </div>
+
+        <div class="row g-4">
+          <div class="col-lg-6">
+            <div class="card shadow-sm h-100">
+              <div class="card-body">
+                <h4 class="h5">Vulnerability Remediation</h4>
+                <p class="small text-muted">RA.L2-3.11.3</p>
+                <form method="post" class="mb-3">
+                  <input type="hidden" name="record_type" value="vulnerability">
+                  <div class="mb-2"><label class="form-label">Title</label><input class="form-control" name="title" required></div>
+                  <div class="row">
+                    <div class="col-md-6 mb-2"><label class="form-label">Severity</label><input class="form-control" name="severity" value="medium"></div>
+                    <div class="col-md-6 mb-2"><label class="form-label">Status</label><input class="form-control" name="status" value="open"></div>
+                  </div>
+                  <div class="mb-2"><label class="form-label">Description</label><textarea class="form-control" name="description" rows="2"></textarea></div>
+                  <div class="mb-2"><label class="form-label">Remediation Plan</label><textarea class="form-control" name="remediation_plan" rows="2"></textarea></div>
+                  <div class="row">
+                    <div class="col-md-4 mb-2"><label class="form-label">Owner</label><input class="form-control" name="owner"></div>
+                    <div class="col-md-4 mb-2"><label class="form-label">Date Identified</label><input class="form-control" type="date" name="date_identified"></div>
+                    <div class="col-md-4 mb-2"><label class="form-label">Date Remediated</label><input class="form-control" type="date" name="date_remediated"></div>
+                  </div>
+                  <button class="btn btn-primary btn-sm">Add Vulnerability</button>
+                </form>
+                {% if vulnerabilities %}
+                  <div class="table-responsive">
+                    <table class="table table-sm table-striped mb-0">
+                      <thead><tr><th>Title</th><th>Severity</th><th>Status</th><th>Owner</th><th>Remediated</th></tr></thead>
+                      <tbody>
+                        {% for item in vulnerabilities %}
+                          <tr><td>{{ item["title"] }}</td><td>{{ item["severity"] }}</td><td>{{ item["status"] }}</td><td>{{ item["owner"] }}</td><td>{{ item["date_remediated"] }}</td></tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% else %}
+                  <p class="text-muted mb-0">No vulnerability records yet.</p>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+
+          <div class="col-lg-6">
+            <div class="card shadow-sm h-100">
+              <div class="card-body">
+                <h4 class="h5">Security Control Assessment</h4>
+                <p class="small text-muted">CA.L2-3.12.1</p>
+                <form method="post" class="mb-3">
+                  <input type="hidden" name="record_type" value="assessment">
+                  <div class="row">
+                    <div class="col-md-4 mb-2"><label class="form-label">Control ID</label><input class="form-control" name="control_id" required></div>
+                    <div class="col-md-8 mb-2"><label class="form-label">Control Name</label><input class="form-control" name="control_name" required></div>
+                  </div>
+                  <div class="mb-2"><label class="form-label">Result</label><input class="form-control" name="result" placeholder="Pass, partial, or fail" required></div>
+                  <div class="mb-2"><label class="form-label">Evidence Notes</label><textarea class="form-control" name="evidence_notes" rows="2"></textarea></div>
+                  <div class="row">
+                    <div class="col-md-6 mb-2"><label class="form-label">Assessed By</label><input class="form-control" name="assessed_by"></div>
+                    <div class="col-md-6 mb-2"><label class="form-label">Assessment Date</label><input class="form-control" type="date" name="assessment_date"></div>
+                  </div>
+                  <button class="btn btn-primary btn-sm">Add Assessment</button>
+                </form>
+                {% if assessments %}
+                  <div class="table-responsive">
+                    <table class="table table-sm table-striped mb-0">
+                      <thead><tr><th>Control</th><th>Name</th><th>Result</th><th>Date</th></tr></thead>
+                      <tbody>
+                        {% for item in assessments %}
+                          <tr><td>{{ item["control_id"] }}</td><td>{{ item["control_name"] }}</td><td>{{ item["result"] }}</td><td>{{ item["assessment_date"] }}</td></tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% else %}
+                  <p class="text-muted mb-0">No assessment records yet.</p>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+
+          <div class="col-lg-6">
+            <div class="card shadow-sm h-100">
+              <div class="card-body">
+                <h4 class="h5">Recovery Planning</h4>
+                <p class="small text-muted">Supports system recovery planning</p>
+                <form method="post" class="mb-3">
+                  <input type="hidden" name="record_type" value="recovery">
+                  <div class="mb-2"><label class="form-label">Recovery Objective</label><input class="form-control" name="recovery_objective" required></div>
+                  <div class="mb-2"><label class="form-label">Backup Location</label><input class="form-control" name="backup_location"></div>
+                  <div class="mb-2"><label class="form-label">Recovery Steps</label><textarea class="form-control" name="recovery_steps" rows="2"></textarea></div>
+                  <div class="row">
+                    <div class="col-md-6 mb-2"><label class="form-label">Responsible Role</label><input class="form-control" name="responsible_role"></div>
+                    <div class="col-md-6 mb-2"><label class="form-label">Last Reviewed Date</label><input class="form-control" type="date" name="last_reviewed_date"></div>
+                  </div>
+                  <button class="btn btn-primary btn-sm">Add Recovery Plan</button>
+                </form>
+                {% if recovery_plans %}
+                  <div class="table-responsive">
+                    <table class="table table-sm table-striped mb-0">
+                      <thead><tr><th>Objective</th><th>Backup Location</th><th>Role</th><th>Reviewed</th></tr></thead>
+                      <tbody>
+                        {% for item in recovery_plans %}
+                          <tr><td>{{ item["recovery_objective"] }}</td><td>{{ item["backup_location"] }}</td><td>{{ item["responsible_role"] }}</td><td>{{ item["last_reviewed_date"] }}</td></tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% else %}
+                  <p class="text-muted mb-0">No recovery planning records yet.</p>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+
+          <div class="col-lg-6">
+            <div class="card shadow-sm h-100">
+              <div class="card-body">
+                <h4 class="h5">Contingency Plan Testing</h4>
+                <p class="small text-muted">Supports contingency plan testing</p>
+                <form method="post" class="mb-3">
+                  <input type="hidden" name="record_type" value="contingency">
+                  <div class="row">
+                    <div class="col-md-7 mb-2"><label class="form-label">Test Name</label><input class="form-control" name="test_name" required></div>
+                    <div class="col-md-5 mb-2"><label class="form-label">Test Date</label><input class="form-control" type="date" name="test_date"></div>
+                  </div>
+                  <div class="mb-2"><label class="form-label">Scenario Tested</label><textarea class="form-control" name="scenario_tested" rows="2"></textarea></div>
+                  <div class="mb-2"><label class="form-label">Result</label><input class="form-control" name="result"></div>
+                  <div class="mb-2"><label class="form-label">Issues Found</label><textarea class="form-control" name="issues_found" rows="2"></textarea></div>
+                  <div class="mb-2"><label class="form-label">Follow-up Actions</label><textarea class="form-control" name="follow_up_actions" rows="2"></textarea></div>
+                  <button class="btn btn-primary btn-sm">Add Test Record</button>
+                </form>
+                {% if contingency_tests %}
+                  <div class="table-responsive">
+                    <table class="table table-sm table-striped mb-0">
+                      <thead><tr><th>Test</th><th>Date</th><th>Result</th><th>Follow-up</th></tr></thead>
+                      <tbody>
+                        {% for item in contingency_tests %}
+                          <tr><td>{{ item["test_name"] }}</td><td>{{ item["test_date"] }}</td><td>{{ item["result"] }}</td><td>{{ item["follow_up_actions"] }}</td></tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% else %}
+                  <p class="text-muted mb-0">No contingency test records yet.</p>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+        </div>
+        """,
+        vulnerabilities=vulnerabilities,
+        assessments=assessments,
+        recovery_plans=recovery_plans,
+        contingency_tests=contingency_tests,
+    )
+    return render_template_string(BASE, title="Security Compliance Center", body=body)
 
 
 @app.route("/backups", methods=["GET", "POST"])
