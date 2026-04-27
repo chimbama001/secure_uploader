@@ -75,6 +75,9 @@ load_dotenv("/home/secureuploader/secure_uploader/.env")
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
+from datetime import timedelta
+app.permanent_session_lifetime = timedelta(minutes=15)
+
 ENV = os.environ.get("FLASK_ENV", "development").lower()
 secure_cookies = False
 
@@ -196,7 +199,7 @@ def blob_exists(blob_name):
 # Encryption key
 # =============================================================================
 # Old local key path disabled after Key Vault migration
-ENC_KEY_B64 = None
+ENC_KEY_B64 = load_backup_key()
 ph = PasswordHasher()
 
 # Data directory (persistent)
@@ -714,7 +717,7 @@ def login():
     conn = db_connect()
     row = conn.execute(
         "SELECT id, password_hash FROM users WHERE username=?",
-        (username,)
+        (username,),
     ).fetchone()
     conn.close()
 
@@ -728,7 +731,9 @@ def login():
         flash("Invalid username or password.")
         return render_template("login.html")
 
+    session.permanent = True
     session["user_id"] = row["id"]
+    flash("Logged in successfully.")
 
     if not session.get("seen_onboarding"):
         return redirect(url_for("onboarding"))
