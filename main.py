@@ -501,6 +501,13 @@ BASE = """<!doctype html>
       {% if session.get('user_id') %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('files') }}">Files</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('upload') }}">Upload</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('incidents') }}">Incidents</a>
+        {% if g.user and g.user.get('role') == 'admin' %}
+          <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('audit_logs_view') }}">Audit Logs</a>
+          <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('baseline') }}">Baseline</a>
+          <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('training') }}">Training</a>
+          <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('backups') }}">Backups</a>
+        {% endif %}
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('logout') }}">Logout</a>
       {% else %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('login') }}">Login</a>
@@ -1188,7 +1195,7 @@ def incidents():
             flash("Title and description are required.")
             return redirect(url_for("incidents"))
 
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.utcnow().isoformat()
         conn = db_connect()
         conn.execute(
             """
@@ -1381,7 +1388,7 @@ def handle_incident(incident_id: int):
         conn.close()
         abort(404)
 
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
     conn.execute(
         """
         INSERT INTO incident_actions(incident_id, action_note, status_after, action_by, action_at)
@@ -1428,7 +1435,7 @@ def backups():
                     backup_info["name"],
                     backup_info["path"].name,
                     int(backup_info["size"]),
-                    datetime.datetime.utcnow().isoformat(),
+                    datetime.utcnow().isoformat(),
                     int(g.user["id"]),
                     1 if backup_info["is_encrypted"] else 0,
                     backup_info["encryption_method"],
