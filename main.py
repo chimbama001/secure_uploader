@@ -37,6 +37,23 @@ def log_event(user_id, username, action, target=None, status="SUCCESS", metadata
     import sqlite3
     import json
     from datetime import datetime
+    from flask import request as _req
+
+    try:
+        ip_address = _req.remote_addr
+    except RuntimeError:
+        ip_address = None
+
+    details = {}
+    if target:
+        details["target"] = target
+    if status:
+        details["status"] = status
+    if metadata:
+        if isinstance(metadata, dict):
+            details.update(metadata)
+        else:
+            details["metadata"] = str(metadata)
 
     try:
         conn = sqlite3.connect("files.db")
@@ -44,17 +61,16 @@ def log_event(user_id, username, action, target=None, status="SUCCESS", metadata
 
         conn.execute(
             """
-            INSERT INTO audit_log
-            (user_id, username, action, target, status, metadata, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audit_logs
+            (event_type, username, user_id, ip_address, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                user_id,
-                username,
                 action,
-                target,
-                status,
-                json.dumps(metadata) if metadata else None,
+                username,
+                user_id,
+                ip_address,
+                json.dumps(details) if details else None,
                 datetime.utcnow().isoformat()
             )
         )
@@ -716,20 +732,32 @@ def login():
 
     conn = db_connect()
     row = conn.execute(
-        "SELECT id, password_hash FROM users WHERE username=?",
-        (username,),
+        "SELECT id, password_hash, failed_login_count, locked_until FROM users WHERE username=?",
+        (username,)
     ).fetchone()
-    conn.close()
 
     if not row:
+        conn.close()
         flash("Invalid username or password.")
+        return render_template("login.html")
+
+    if is_account_locked(row):
+        conn.close()
+        flash("Account is temporarily locked due to repeated failed login attempts. Please try again later.")
         return render_template("login.html")
 
     try:
         ph.verify(row["password_hash"], password)
     except VerifyMismatchError:
+        record_failed_login(conn, row)
+        conn.close()
+        log_event(row["id"], username, "LOGIN", status="FAIL")
         flash("Invalid username or password.")
         return render_template("login.html")
+
+    clear_lockout_state(conn, row["id"])
+    conn.close()
+    log_event(row["id"], username, "LOGIN", status="SUCCESS")
 
     session.permanent = True
     session["user_id"] = row["id"]
@@ -739,6 +767,7 @@ def login():
         return redirect(url_for("onboarding"))
 
     return redirect(url_for("files"))
+
 
 @app.route("/auth/callback")
 def auth_callback():
@@ -958,7 +987,7 @@ def upload():
                 stored_name,
                 mime,
                 len(file_bytes),
-                datetime.datetime.utcnow().isoformat(),
+                datetime.utcnow().isoformat(),
                 int(g.user["id"]),
                 1 if client_encrypted else 0,
             )
@@ -1765,6 +1794,138 @@ def share_file(file_id):
     flash(f"File shared securely with {target_username}. They will need the share password to download it.")
     return redirect(url_for("files"))
 
+
+
+@app.route("/audit-logs")
+@login_required
+def audit_logs_view():
+    if not is_admin():
+        abort(403)
+
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT id, event_type, username, user_id, ip_address, details, created_at "
+        "FROM audit_logs ORDER BY created_at DESC LIMIT 200"
+    ).fetchall()
+    conn.close()
+
+    body = render_template_string(
+        """
+        <h3>Audit Logs</h3>
+        <p class="text-muted">Recent system events (AU.L2-3.3.1). Showing last 200 entries.</p>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped">
+            <thead>
+              <tr><th>#</th><th>Event</th><th>User</th><th>IP</th><th>Details</th><th>Timestamp</th></tr>
+            </thead>
+            <tbody>
+              {% for r in rows %}
+              <tr>
+                <td>{{ r["id"] }}</td>
+                <td><span class="badge bg-secondary">{{ r["event_type"] }}</span></td>
+                <td>{{ r["username"] }}</td>
+                <td>{{ r["ip_address"] or "—" }}</td>
+                <td><small>{{ r["details"] or "" }}</small></td>
+                <td><small>{{ r["created_at"] }}</small></td>
+              </tr>
+              {% endfor %}
+              {% if not rows %}
+              <tr><td colspan="6" class="text-muted text-center">No audit events recorded yet.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+        """,
+        rows=rows
+    )
+    return page("Audit Logs", body)
+
+
+@app.route("/baseline")
+@login_required
+def baseline():
+    if not is_admin():
+        abort(403)
+
+    import json as _json
+    baseline_path = os.path.join(DATA_DIR, "baseline_snapshot.json")
+    try:
+        with open(baseline_path) as f:
+            data = _json.load(f)
+        rows = list(data.items())
+    except Exception as e:
+        rows = [("error", str(e))]
+
+    body = render_template_string(
+        """
+        <h3>System Baseline</h3>
+        <p class="text-muted">CM.L2-3.4.1 — Approved configuration snapshot from
+          <code>baseline_snapshot.json</code>.</p>
+        <div class="card shadow-sm">
+          <div class="table-responsive">
+            <table class="table table-sm table-striped mb-0">
+              <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+              <tbody>
+                {% for key, val in rows %}
+                <tr><td><code>{{ key }}</code></td><td>{{ val }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        """,
+        rows=rows
+    )
+    return page("System Baseline", body)
+
+
+@app.route("/training")
+@login_required
+def training():
+    if not is_admin():
+        abort(403)
+
+    body = """
+    <h3>Role-Based Security Training</h3>
+    <p class="text-muted">AT.L2-3.2.2 — Documented training requirements by role.</p>
+    <div class="row g-4">
+      <div class="col-md-6">
+        <div class="card shadow-sm h-100">
+          <div class="card-body">
+            <h4 class="h5">Standard User</h4>
+            <table class="table table-sm table-striped mt-2">
+              <thead><tr><th>Training Topic</th><th>Frequency</th></tr></thead>
+              <tbody>
+                <tr><td>Acceptable Use Policy</td><td>Annual</td></tr>
+                <tr><td>Password hygiene and phishing awareness</td><td>Annual</td></tr>
+                <tr><td>Secure file handling and sharing</td><td>Annual</td></tr>
+                <tr><td>Incident reporting procedure</td><td>Annual</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card shadow-sm h-100">
+          <div class="card-body">
+            <h4 class="h5">Administrator</h4>
+            <table class="table table-sm table-striped mt-2">
+              <thead><tr><th>Training Topic</th><th>Frequency</th></tr></thead>
+              <tbody>
+                <tr><td>All standard user training (above)</td><td>Annual</td></tr>
+                <tr><td>System configuration and baselining</td><td>Annual</td></tr>
+                <tr><td>Audit log review and monitoring</td><td>Annual</td></tr>
+                <tr><td>Incident response and escalation</td><td>Annual</td></tr>
+                <tr><td>Backup creation and recovery testing</td><td>Annual</td></tr>
+                <tr><td>Access control and user lifecycle management</td><td>Annual</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+    return page("Role-Based Training", body)
 
 
 if __name__ == "__main__":
