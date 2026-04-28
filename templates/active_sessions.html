@@ -1,0 +1,48 @@
+{% extends 'base.html' %}
+
+{% block title %}Active Sessions - Secure Uploader{% endblock %}
+
+{% block content %}
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2>Active Sessions</h2>
+  </div>
+
+  {% if sessions %}
+    <div class="card">
+      <div class="table-responsive">
+        <table class="table table-striped mb-0 card-table">
+          <thead class="table-light">
+            <tr>
+              <th>Username</th>
+              <th>IP Address</th>
+              <th>Login Time</th>
+              <th>Last Activity</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for session in sessions %}
+            <tr>
+              <td>{{ session.username }}</td>
+              <td>{{ session.ip }}</td>
+              <td>{{ session.login_time.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+              <td>{{ session.last_activity.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+              <td>
+                {% if (now - session.last_activity).total_seconds() < 30 %}
+                  <span class="badge bg-success">Active</span>
+                {% elif (now - session.last_activity).total_seconds() < 60 %}
+                  <span class="badge bg-warning">Idle</span>
+                {% else %}
+                  <span class="badge bg-secondary">Inactive</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% else %}
+    <div class="alert alert-info">No active sessions found.</div>
+  {% endif %}
+{% endblock %}

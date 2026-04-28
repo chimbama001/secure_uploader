@@ -40,6 +40,9 @@ from crypto_utils import encrypt_bytes, decrypt_bytes
 from backup_utils import BACKUP_ENCRYPTION_METHOD, create_protected_backup, load_backup_key
 
 
+active_sessions = {}
+
+
 def log_event(user_id, username, action, target=None, status="SUCCESS", metadata=None):
     import sqlite3
     import json
@@ -85,17 +88,21 @@ app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 ENV = os.environ.get("FLASK_ENV", "development").lower()
 secure_cookies = False
 
+from datetime import timedelta
+
 app.config.update(
     SESSION_COOKIE_SECURE=False,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     MAX_CONTENT_LENGTH=200 * 1024 * 1024,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),  # Maximum session lifetime
+    SESSION_PERMANENT=True,
 )
 
 SIGNUP_ENABLED = os.getenv("SIGNUP_ENABLED", "false").lower() == "true"
 SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
 
-DATA_DIR = os.environ.get("DATA_DIR") or "/home/secureuploader/secure_uploader"
+DATA_DIR = os.environ.get("DATA_DIR") or str(Path(__file__).resolve().parent)
 DATA_DIR = os.path.abspath(DATA_DIR)
 DB_PATH = os.path.join(DATA_DIR, "files.db")
 
@@ -118,6 +125,27 @@ else:
         return f
     def signup_limit(f):
         return f
+
+@app.before_request
+def update_activity():
+    if 'user_id' in session and 'session_id' in session and session['session_id'] in active_sessions:
+        session_data = active_sessions[session['session_id']]
+        now = datetime.datetime.utcnow()
+        idle_timeout = 30  # 30 seconds of inactivity
+        
+        # Check for session expiration before updating
+        if (now - session_data['last_activity']).total_seconds() > idle_timeout:
+            active_sessions.pop(session['session_id'], None)
+            session.clear()
+            flash("Your session has expired due to inactivity.")
+            return redirect(url_for('login'))
+        
+        # Update last activity if session is still valid
+        active_sessions[session['session_id']]['last_activity'] = now
+
+@app.context_processor
+def inject_admin():
+    return {'is_admin': is_admin()}
 
 # =============================================================================
 # Blob Storage
@@ -160,7 +188,6 @@ def blob_exists(blob_name: str) -> bool:
 # =============================================================================
 # Encryption key
 # =============================================================================
-ENC_KEY_B64 = load_key_from_env(os.environ.get("UPLOAD_ENC_KEY"))
 ph = PasswordHasher()
 
 # Data directory (persistent)
@@ -299,6 +326,35 @@ def ensure_schema():
     )
 
 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS maintenance_personnel (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      approved_by INTEGER NOT NULL,
+      approved_at TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      revoked_by INTEGER,
+      revoked_at TEXT,
+      revoke_reason TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (approved_by) REFERENCES users(id)
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS maintenance_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      personnel_id INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      performed_by INTEGER NOT NULL,
+      performed_at TEXT NOT NULL,
+      notes TEXT,
+      FOREIGN KEY (personnel_id) REFERENCES maintenance_personnel(id),
+      FOREIGN KEY (performed_by) REFERENCES users(id)
+    );
+    """)
+
     conn.commit()
     conn.close()
 
@@ -395,6 +451,7 @@ BASE = """
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('upload') }}">Upload</a>
         {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('incidents') }}">Incidents</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('maintenance_personnel') }}">Maintenance</a>
         {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('backups') }}">Backups</a>
         {% endif %}
@@ -530,7 +587,7 @@ def login():
 
         conn = db_connect()
         row = conn.execute(
-            "SELECT id, password_hash FROM users WHERE username=?",
+            "SELECT id, username, password_hash FROM users WHERE username=?",
             (username,)
         ).fetchone()
         conn.close()
@@ -546,6 +603,14 @@ def login():
             return redirect(url_for("login"))
 
         session["user_id"] = row["id"]
+        session['session_id'] = str(uuid.uuid4())
+        active_sessions[session['session_id']] = {
+            'user_id': row["id"],
+            'username': row["username"],
+            'login_time': datetime.datetime.utcnow(),
+            'last_activity': datetime.datetime.utcnow(),
+            'ip': request.remote_addr
+        }
         flash("Logged in successfully.")
         if not session.get("seen_onboarding"):
               return redirect(url_for("onboarding"))
@@ -666,9 +731,36 @@ def signup():
 
 @app.route("/logout")
 def logout():
+    if 'session_id' in session:
+        active_sessions.pop(session['session_id'], None)
     session.clear()
     flash("Logged out.")
     return redirect(url_for("home"))
+
+@app.route("/active-sessions")
+@login_required
+def active_sessions_view():
+    if not is_admin():
+        abort(403)
+    now = datetime.datetime.utcnow()
+    # Consider active if last activity within 30 seconds
+    active = {k: v for k, v in active_sessions.items() if (now - v['last_activity']).total_seconds() < 30}
+    return render_template('active_sessions.html', sessions=list(active.values()), now=now)
+
+@app.route("/audit-logs")
+@login_required
+def audit_logs():
+    if not is_admin():
+        abort(403)
+    conn = db_connect()
+    logs = conn.execute("""
+        SELECT timestamp, username, action, target, status, metadata
+        FROM audit_log
+        ORDER BY timestamp DESC
+        LIMIT 1000
+    """).fetchall()
+    conn.close()
+    return render_template('audit_logs.html', logs=logs)
 
 @app.route("/add-user", methods=["GET", "POST"])
 def add_user():
@@ -1365,6 +1457,369 @@ def share_file(file_id):
     flash(f"File shared with {target_username}.")
     return redirect(url_for("files"))
 
+
+# =============================================================================
+# MA.L2-3.7.6 — Maintenance Personnel
+# =============================================================================
+
+def is_maintenance_personnel(user_id: int) -> bool:
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT id FROM maintenance_personnel WHERE user_id=? AND status='active'",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+@app.route("/maintenance-personnel", methods=["GET"])
+@login_required
+def maintenance_personnel():
+    if not is_admin():
+        abort(403)
+
+    conn = db_connect()
+    records = conn.execute("""
+        SELECT mp.id, mp.approved_at, mp.reason, mp.status,
+               mp.revoked_at, mp.revoke_reason,
+               u.username AS personnel_name,
+               approver.username AS approver_name,
+               revoker.username AS revoker_name
+        FROM maintenance_personnel mp
+        JOIN users u ON u.id = mp.user_id
+        JOIN users approver ON approver.id = mp.approved_by
+        LEFT JOIN users revoker ON revoker.id = mp.revoked_by
+        ORDER BY mp.approved_at DESC
+    """).fetchall()
+
+    all_users = conn.execute(
+        "SELECT id, username FROM users ORDER BY username"
+    ).fetchall()
+    conn.close()
+
+    body = render_template_string("""
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <div>
+        <h3 class="mb-1">Maintenance Personnel</h3>
+        <p class="text-muted mb-0">
+          MA.L2-3.7.6 — Only vetted and authorized personnel may perform system maintenance.
+          All authorizations and revocations are logged.
+        </p>
+      </div>
+      <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#authorizeModal">
+        Authorize Personnel
+      </button>
+    </div>
+
+    <!-- Authorization modal -->
+    <div class="modal fade" id="authorizeModal" tabindex="-1">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Authorize Maintenance Personnel</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <form method="post" action="{{ url_for('maintenance_personnel_authorize') }}">
+            <div class="modal-body">
+              <div class="mb-3">
+                <label class="form-label fw-semibold">Select User</label>
+                <select class="form-select" name="user_id" required>
+                  <option value="">— choose user —</option>
+                  {% for u in all_users %}
+                    <option value="{{ u['id'] }}">{{ u['username'] }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="mb-3">
+                <label class="form-label fw-semibold">Reason / Justification</label>
+                <textarea class="form-control" name="reason" rows="3" required
+                  placeholder="Why is this person authorized to perform maintenance?"></textarea>
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+              <button type="submit" class="btn btn-primary">Authorize</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    {% if records %}
+    <div class="card shadow-sm">
+      <div class="table-responsive">
+        <table class="table table-striped mb-0">
+          <thead>
+            <tr>
+              <th>Personnel</th>
+              <th>Status</th>
+              <th>Authorized By</th>
+              <th>Authorized At</th>
+              <th>Reason</th>
+              <th>Revocation</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in records %}
+            <tr>
+              <td><strong>{{ r['personnel_name'] }}</strong></td>
+              <td>
+                {% if r['status'] == 'active' %}
+                  <span class="badge bg-success">Active</span>
+                {% else %}
+                  <span class="badge bg-secondary">Revoked</span>
+                {% endif %}
+              </td>
+              <td>{{ r['approver_name'] }}</td>
+              <td>{{ r['approved_at'][:19] }}</td>
+              <td><small>{{ r['reason'] }}</small></td>
+              <td>
+                {% if r['status'] == 'revoked' %}
+                  <small class="text-muted">
+                    By {{ r['revoker_name'] }} at {{ r['revoked_at'][:19] }}<br>
+                    {{ r['revoke_reason'] }}
+                  </small>
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>
+                {% if r['status'] == 'active' %}
+                <button class="btn btn-sm btn-outline-danger"
+                        data-bs-toggle="modal"
+                        data-bs-target="#revokeModal{{ r['id'] }}">
+                  Revoke
+                </button>
+
+                <!-- Revoke modal per record -->
+                <div class="modal fade" id="revokeModal{{ r['id'] }}" tabindex="-1">
+                  <div class="modal-dialog">
+                    <div class="modal-content">
+                      <div class="modal-header">
+                        <h5 class="modal-title">Revoke Maintenance Access — {{ r['personnel_name'] }}</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                      </div>
+                      <form method="post" action="{{ url_for('maintenance_personnel_revoke', record_id=r['id']) }}">
+                        <div class="modal-body">
+                          <div class="mb-3">
+                            <label class="form-label fw-semibold">Reason for Revocation</label>
+                            <textarea class="form-control" name="revoke_reason" rows="3" required
+                              placeholder="Why is maintenance access being revoked?"></textarea>
+                          </div>
+                        </div>
+                        <div class="modal-footer">
+                          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                          <button type="submit" class="btn btn-danger">Revoke Access</button>
+                        </div>
+                      </form>
+                    </div>
+                  </div>
+                </div>
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% else %}
+    <div class="alert alert-warning">
+      No maintenance personnel have been authorized yet. Use the button above to authorize a vetted user.
+    </div>
+    {% endif %}
+    """, records=records, all_users=all_users)
+
+    return render_template_string(BASE, title="Maintenance Personnel", body=body, signup_enabled=SIGNUP_ENABLED)
+
+
+@app.route("/maintenance-personnel/authorize", methods=["POST"])
+@login_required
+def maintenance_personnel_authorize():
+    if not is_admin():
+        abort(403)
+
+    user_id = request.form.get("user_id", "").strip()
+    reason = request.form.get("reason", "").strip()
+
+    if not user_id or not reason:
+        flash("User and reason are required.")
+        return redirect(url_for("maintenance_personnel"))
+
+    try:
+        user_id = int(user_id)
+    except ValueError:
+        flash("Invalid user.")
+        return redirect(url_for("maintenance_personnel"))
+
+    conn = db_connect()
+
+    # Verify target user exists
+    target = conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        flash("User not found.")
+        return redirect(url_for("maintenance_personnel"))
+
+    # Check if already active
+    existing = conn.execute(
+        "SELECT id FROM maintenance_personnel WHERE user_id=? AND status='active'",
+        (user_id,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        flash(f"{target['username']} already has active maintenance authorization.")
+        return redirect(url_for("maintenance_personnel"))
+
+    now = datetime.datetime.utcnow().isoformat()
+    cur = conn.execute(
+        """INSERT INTO maintenance_personnel(user_id, approved_by, approved_at, reason, status)
+           VALUES (?, ?, ?, ?, 'active')""",
+        (user_id, g.user["id"], now, reason)
+    )
+    record_id = cur.lastrowid
+
+    conn.execute(
+        """INSERT INTO maintenance_log(personnel_id, action, performed_by, performed_at, notes)
+           VALUES (?, 'authorized', ?, ?, ?)""",
+        (record_id, g.user["id"], now, reason)
+    )
+    conn.commit()
+    conn.close()
+
+    log_event(
+        g.user["id"], g.user["username"],
+        "maintenance_authorize",
+        target["username"],
+        "SUCCESS",
+        {"reason": reason}
+    )
+
+    flash(f"{target['username']} authorized as maintenance personnel.")
+    return redirect(url_for("maintenance_personnel"))
+
+
+@app.route("/maintenance-personnel/<int:record_id>/revoke", methods=["POST"])
+@login_required
+def maintenance_personnel_revoke(record_id: int):
+    if not is_admin():
+        abort(403)
+
+    revoke_reason = request.form.get("revoke_reason", "").strip()
+    if not revoke_reason:
+        flash("A reason is required to revoke access.")
+        return redirect(url_for("maintenance_personnel"))
+
+    conn = db_connect()
+    record = conn.execute(
+        """SELECT mp.id, mp.user_id, mp.status, u.username
+           FROM maintenance_personnel mp
+           JOIN users u ON u.id = mp.user_id
+           WHERE mp.id=?""",
+        (record_id,)
+    ).fetchone()
+
+    if not record:
+        conn.close()
+        abort(404)
+
+    if record["status"] != "active":
+        conn.close()
+        flash("This authorization is already revoked.")
+        return redirect(url_for("maintenance_personnel"))
+
+    now = datetime.datetime.utcnow().isoformat()
+    conn.execute(
+        """UPDATE maintenance_personnel
+           SET status='revoked', revoked_by=?, revoked_at=?, revoke_reason=?
+           WHERE id=?""",
+        (g.user["id"], now, revoke_reason, record_id)
+    )
+    conn.execute(
+        """INSERT INTO maintenance_log(personnel_id, action, performed_by, performed_at, notes)
+           VALUES (?, 'revoked', ?, ?, ?)""",
+        (record_id, g.user["id"], now, revoke_reason)
+    )
+    conn.commit()
+    conn.close()
+
+    log_event(
+        g.user["id"], g.user["username"],
+        "maintenance_revoke",
+        record["username"],
+        "SUCCESS",
+        {"reason": revoke_reason}
+    )
+
+    flash(f"Maintenance access revoked for {record['username']}.")
+    return redirect(url_for("maintenance_personnel"))
+
+
+@app.route("/maintenance-personnel/log")
+@login_required
+def maintenance_personnel_log():
+    if not is_admin():
+        abort(403)
+
+    conn = db_connect()
+    entries = conn.execute("""
+        SELECT ml.action, ml.performed_at, ml.notes,
+               actor.username AS actor_name,
+               u.username AS personnel_name
+        FROM maintenance_log ml
+        JOIN maintenance_personnel mp ON mp.id = ml.personnel_id
+        JOIN users u ON u.id = mp.user_id
+        JOIN users actor ON actor.id = ml.performed_by
+        ORDER BY ml.performed_at DESC
+        LIMIT 500
+    """).fetchall()
+    conn.close()
+
+    body = render_template_string("""
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <div>
+        <h3 class="mb-1">Maintenance Personnel Log</h3>
+        <p class="text-muted mb-0">Full audit trail of all authorization and revocation events.</p>
+      </div>
+      <a class="btn btn-outline-secondary" href="{{ url_for('maintenance_personnel') }}">← Back</a>
+    </div>
+    {% if entries %}
+    <div class="card shadow-sm">
+      <div class="table-responsive">
+        <table class="table table-striped mb-0">
+          <thead>
+            <tr><th>Time</th><th>Action</th><th>Personnel</th><th>By</th><th>Notes</th></tr>
+          </thead>
+          <tbody>
+          {% for e in entries %}
+            <tr>
+              <td><small>{{ e['performed_at'][:19] }}</small></td>
+              <td>
+                {% if e['action'] == 'authorized' %}
+                  <span class="badge bg-success">Authorized</span>
+                {% else %}
+                  <span class="badge bg-danger">Revoked</span>
+                {% endif %}
+              </td>
+              <td>{{ e['personnel_name'] }}</td>
+              <td>{{ e['actor_name'] }}</td>
+              <td><small>{{ e['notes'] }}</small></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% else %}
+    <p class="text-muted">No log entries yet.</p>
+    {% endif %}
+    """, entries=entries)
+
+    return render_template_string(BASE, title="Maintenance Log", body=body, signup_enabled=SIGNUP_ENABLED)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=(ENV != "production"))
- 
