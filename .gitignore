@@ -49,3 +49,5 @@ files.db
 __pycache__/
 files.db
 *.bak.*
+audit_log.ndjson
+maintenance_personnel.json
