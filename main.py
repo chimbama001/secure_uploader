@@ -357,6 +357,17 @@ def ensure_schema():
     "ALTER TABLE file_access ADD COLUMN can_share INTEGER NOT NULL DEFAULT 0"
     )
 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS password_reset_requests (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       INTEGER NOT NULL,
+      username      TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      requested_at  TEXT NOT NULL,
+      resolved_at   TEXT,
+      resolved_by   INTEGER
+    );
+    """)
 
     conn.commit()
     conn.close()
@@ -507,6 +518,7 @@ BASE = """<!doctype html>
           <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('baseline') }}">Baseline</a>
           <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('training') }}">Training</a>
           <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('backups') }}">Backups</a>
+          <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('reset_requests') }}">Reset Requests</a>
         {% endif %}
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('logout') }}">Logout</a>
       {% else %}
@@ -732,7 +744,30 @@ def record_failed_login(conn, user_row):
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
-        return render_template("login.html")
+        body = """
+        <div class="row justify-content-center">
+          <div class="col-md-6">
+            <div class="card shadow-sm">
+              <div class="card-body">
+                <h3 class="card-title">Login</h3>
+                <form method="post" action="/login">
+                  <div class="mb-3">
+                    <label class="form-label">Username</label>
+                    <input class="form-control" type="text" name="username" required>
+                  </div>
+                  <div class="mb-3">
+                    <label class="form-label">Password</label>
+                    <input class="form-control" type="password" name="password" required>
+                  </div>
+                  <button class="btn btn-primary" type="submit">Log in</button>
+                  <a class="btn btn-link" href="/forgot-password">Forgot Password?</a>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
+        return page("Login", body)
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
@@ -1933,6 +1968,149 @@ def training():
     </div>
     """
     return page("Role-Based Training", body)
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "GET":
+        body = """
+        <div class="row justify-content-center">
+          <div class="col-md-6">
+            <div class="card shadow-sm">
+              <div class="card-body">
+                <h3 class="card-title">Forgot Password</h3>
+                <p class="text-muted">Enter your username and an admin will set a temporary password for you.</p>
+                <form method="post">
+                  <div class="mb-3">
+                    <label class="form-label">Username</label>
+                    <input class="form-control" name="username" required>
+                  </div>
+                  <button class="btn btn-primary">Submit Request</button>
+                  <a class="btn btn-link" href="/login">Back to Login</a>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
+        return page("Forgot Password", body)
+
+    username = (request.form.get("username") or "").strip()
+    if username:
+        conn = db_connect()
+        user_row = conn.execute(
+            "SELECT id FROM users WHERE username=?", (username,)
+        ).fetchone()
+        if user_row:
+            conn.execute(
+                """INSERT INTO password_reset_requests
+                   (user_id, username, status, requested_at)
+                   VALUES (?,?,?,?)""",
+                (user_row["id"], username, "pending", datetime.utcnow().isoformat())
+            )
+            conn.commit()
+            log_event(user_row["id"], username, "PASSWORD_RESET_REQUEST", status="PENDING")
+        conn.close()
+
+    flash("If that username exists, your request has been recorded. Contact an admin to receive your temporary password.")
+    return redirect(url_for("login"))
+
+
+@app.route("/reset-requests")
+@login_required
+def reset_requests():
+    if not is_admin():
+        abort(403)
+
+    conn = db_connect()
+    rows = conn.execute(
+        """SELECT id, user_id, username, status, requested_at, resolved_at
+           FROM password_reset_requests
+           ORDER BY requested_at DESC"""
+    ).fetchall()
+    conn.close()
+
+    body = render_template_string(
+        """
+        <h3>Password Reset Requests</h3>
+        <p class="text-muted">Review pending requests and set a temporary password for the user.</p>
+        {% if rows %}
+        <div class="table-responsive">
+          <table class="table table-striped align-middle">
+            <thead>
+              <tr><th>#</th><th>Username</th><th>Status</th><th>Requested</th><th>Action</th></tr>
+            </thead>
+            <tbody>
+            {% for r in rows %}
+              <tr>
+                <td>{{ r["id"] }}</td>
+                <td>{{ r["username"] }}</td>
+                <td><span class="badge {{ 'bg-warning text-dark' if r['status'] == 'pending' else 'bg-success' }}">{{ r["status"] }}</span></td>
+                <td><small>{{ r["requested_at"] }}</small></td>
+                <td>
+                  {% if r["status"] == "pending" %}
+                  <form method="post" action="/reset-requests/{{ r['id'] }}/do-reset" class="d-flex gap-2 align-items-center flex-wrap">
+                    <input class="form-control form-control-sm" type="password" name="new_password"
+                           placeholder="New temporary password" style="width:220px;" required>
+                    <button class="btn btn-sm btn-primary">Set Password</button>
+                  </form>
+                  {% else %}
+                  <small class="text-muted">Resolved {{ r["resolved_at"] or "" }}</small>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="text-muted">No password reset requests yet.</p>
+        {% endif %}
+        """,
+        rows=rows
+    )
+    return page("Reset Requests", body)
+
+
+@app.route("/reset-requests/<int:req_id>/do-reset", methods=["POST"])
+@login_required
+def resolve_reset_request(req_id):
+    if not is_admin():
+        abort(403)
+
+    new_password = request.form.get("new_password") or ""
+    if not valid_password(new_password):
+        flash("Password must be 12+ chars with upper, lower, number, and special character.")
+        return redirect(url_for("reset_requests"))
+
+    conn = db_connect()
+    req_row = conn.execute(
+        "SELECT id, user_id, username, status FROM password_reset_requests WHERE id=?",
+        (req_id,)
+    ).fetchone()
+
+    if not req_row or req_row["status"] != "pending":
+        conn.close()
+        flash("Request not found or already resolved.")
+        return redirect(url_for("reset_requests"))
+
+    pw_hash = ph.hash(new_password)
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (pw_hash, req_row["user_id"]))
+    conn.execute(
+        """UPDATE password_reset_requests
+           SET status='completed', resolved_at=?, resolved_by=?
+           WHERE id=?""",
+        (datetime.utcnow().isoformat(), g.user["id"], req_id)
+    )
+    conn.commit()
+    conn.close()
+
+    log_event(
+        g.user["id"], g.user["username"], "PASSWORD_RESET",
+        target=req_row["username"], status="SUCCESS"
+    )
+    flash(f"Password reset for {req_row['username']}. Notify them of the temporary password.")
+    return redirect(url_for("reset_requests"))
 
 
 if __name__ == "__main__":
