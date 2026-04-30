@@ -3,29 +3,25 @@ import re
 import io
 import uuid
 import sqlite3
-import datetime
+
+import msal
+from urllib.parse import urlencode
+
+from datetime import datetime, timedelta, timezone
+
 from pathlib import Path
 from functools import wraps
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-from flask import (
-    Flask,
-    request,
-    redirect,
-    url_for,
-    render_template_string,
-    flash,
-    session,
-    g,
-    send_file,
-    abort,
-)
+from flask import Flask, request, redirect, url_for, session, flash, render_template, render_template_string, g
+
 from werkzeug.utils import secure_filename
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from azure.storage.blob import BlobServiceClient
+from kv_crypto import encrypt_file_with_keyvault, decrypt_file_with_keyvault
 
 try:
     from flask_limiter import Limiter
@@ -35,8 +31,6 @@ except Exception:
     get_remote_address = None
 
 from crypto_utils import load_key_from_env, encrypt_bytes, decrypt_bytes
-# ---- crypto utils (your existing module) ----
-from crypto_utils import encrypt_bytes, decrypt_bytes
 from backup_utils import BACKUP_ENCRYPTION_METHOD, create_protected_backup, load_backup_key
 
 
@@ -47,6 +41,23 @@ def log_event(user_id, username, action, target=None, status="SUCCESS", metadata
     import sqlite3
     import json
     from datetime import datetime
+    from flask import request as _req
+
+    try:
+        ip_address = _req.remote_addr
+    except RuntimeError:
+        ip_address = None
+
+    details = {}
+    if target:
+        details["target"] = target
+    if status:
+        details["status"] = status
+    if metadata:
+        if isinstance(metadata, dict):
+            details.update(metadata)
+        else:
+            details["metadata"] = str(metadata)
 
     try:
         conn = sqlite3.connect("files.db")
@@ -54,17 +65,16 @@ def log_event(user_id, username, action, target=None, status="SUCCESS", metadata
 
         conn.execute(
             """
-            INSERT INTO audit_log
-            (user_id, username, action, target, status, metadata, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO audit_logs
+            (event_type, username, user_id, ip_address, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                user_id,
-                username,
                 action,
-                target,
-                status,
-                json.dumps(metadata) if metadata else None,
+                username,
+                user_id,
+                ip_address,
+                json.dumps(details) if details else None,
                 datetime.utcnow().isoformat()
             )
         )
@@ -85,6 +95,9 @@ load_dotenv("/home/secureuploader/secure_uploader/.env")
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
+from datetime import timedelta
+app.permanent_session_lifetime = timedelta(minutes=15)
+
 ENV = os.environ.get("FLASK_ENV", "development").lower()
 secure_cookies = False
 
@@ -99,6 +112,8 @@ app.config.update(
     SESSION_PERMANENT=True,
 )
 
+MFA_ENABLED = os.getenv("MFA_ENABLED", "false").lower() == "true"
+
 SIGNUP_ENABLED = os.getenv("SIGNUP_ENABLED", "false").lower() == "true"
 SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
 
@@ -107,6 +122,21 @@ DATA_DIR = os.path.abspath(DATA_DIR)
 DB_PATH = os.path.join(DATA_DIR, "files.db")
 
 ph = PasswordHasher()
+
+@app.before_request
+def load_user():
+    g.user = None
+
+    if "user_id" in session:
+        conn = db_connect()
+        user = conn.execute(
+            "SELECT id, username FROM users WHERE id=?",
+            (session["user_id"],)
+        ).fetchone()
+        conn.close()
+
+        if user:
+            g.user = user
 
 if Limiter and get_remote_address:
     limiter = Limiter(
@@ -174,16 +204,40 @@ def upload_blob_bytes(blob_name: str, data: bytes) -> None:
             f.write(data)
 
 def download_blob_bytes(blob_name: str) -> bytes:
-    blob_client = container_client.get_blob_client(blob_name)
-    return blob_client.download_blob().readall()
+    # Try Azure Blob first if configured
+    if container_client is not None:
+        blob_client = container_client.get_blob_client(blob_name)
+        return blob_client.download_blob().readall()
+
+    # Local fallback if Blob is not configured
+    local_path = os.path.join(UPLOAD_DIR, blob_name)
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(f"Local file not found: {local_path}")
+
+    with open(local_path, "rb") as f:
+        return f.read()
 
 def delete_blob_bytes(blob_name: str) -> None:
-    blob_client = container_client.get_blob_client(blob_name)
-    blob_client.delete_blob(delete_snapshots="include")
+    if container_client is not None:
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.delete_blob(delete_snapshots="include")
+        return
 
-def blob_exists(blob_name: str) -> bool:
-    blob_client = container_client.get_blob_client(blob_name)
-    return blob_client.exists()
+    local_path = os.path.join(UPLOAD_DIR, blob_name)
+    if os.path.exists(local_path):
+        os.remove(local_path)
+
+def blob_exists(blob_name):
+    if container_client is not None:
+        try:
+            blob_client = container_client.get_blob_client(blob_name)
+            return blob_client.exists()
+        except Exception as e:
+            app.logger.exception(f"blob_exists failed for {blob_name}: {e}")
+            return False
+
+    local_path = os.path.join(UPLOAD_DIR, blob_name)
+    return os.path.exists(local_path)
 
 # =============================================================================
 # Encryption key
@@ -204,8 +258,9 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 app.config["UPLOAD_DIR"] = UPLOAD_DIR
 app.config["BACKUP_DIR"] = BACKUP_DIR
 
+
 # Encryption key for server-side encryption
-ENC_KEY_B64 = load_backup_key()
+# ENC_KEY_B64 = load_backup_key()  # disabled after Key Vault migration
   # uses env var or fallback, per your crypto_utils
 
 
@@ -224,7 +279,6 @@ def ensure_column(conn, table: str, column: str, ddl: str):
     cols = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if column not in cols:
         conn.execute(ddl)
-
 
 def ensure_schema():
     conn = db_connect()
@@ -254,14 +308,18 @@ def ensure_schema():
     );
     """)
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS file_access (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      file_id INTEGER NOT NULL,
-      user_id INTEGER NOT NULL,
-      can_read INTEGER NOT NULL DEFAULT 1,
-      can_delete INTEGER NOT NULL DEFAULT 0,
-      UNIQUE(file_id, user_id)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS file_shares (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        owner_id INTEGER NOT NULL,
+        recipient_id INTEGER NOT NULL,
+        share_password_hash TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(file_id, recipient_id),
+        FOREIGN KEY(file_id) REFERENCES files(id),
+        FOREIGN KEY(owner_id) REFERENCES users(id),
+        FOREIGN KEY(recipient_id) REFERENCES users(id)
     );
     """)
 
@@ -325,6 +383,17 @@ def ensure_schema():
     "ALTER TABLE file_access ADD COLUMN can_share INTEGER NOT NULL DEFAULT 0"
     )
 
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS password_reset_requests (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id       INTEGER NOT NULL,
+      username      TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      requested_at  TEXT NOT NULL,
+      resolved_at   TEXT,
+      resolved_by   INTEGER
+    );
+    """)
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS maintenance_personnel (
@@ -427,61 +496,112 @@ def get_incident_actions(incident_ids):
         actions_by_incident.setdefault(row["incident_id"], []).append(row)
     return actions_by_incident
 
+def get_shared_files_for_user(user_id):
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                f.id,
+                f.filename,
+                f.orig_name,
+                f.stored_name,
+                f.mime,
+                f.size,
+                f.uploaded_at,
+                f.owner_id,
+                f.client_encrypted,
+                fa.can_read,
+                fa.can_delete,
+                fa.can_share,
+                fa.share_password_hash,
+                u.username AS owner_username
+            FROM file_access fa
+            JOIN files f ON fa.file_id = f.id
+            JOIN users u ON u.id = f.owner_id
+            WHERE fa.user_id = ? AND fa.can_read = 1
+            ORDER BY f.uploaded_at DESC
+            """,
+            (int(user_id),)
+        ).fetchall()
+        return rows
+    finally:
+        conn.close()
+
+def build_msal_app(cache=None):
+    return msal.ConfidentialClientApplication(
+        os.getenv("ENTRA_CLIENT_ID"),
+        authority=f"https://login.microsoftonline.com/{os.getenv('ENTRA_TENANT_ID')}",
+        client_credential=os.getenv("ENTRA_CLIENT_SECRET"),
+        token_cache=cache,
+    )
+
+def build_auth_url(scopes=None, state=None):
+    return build_msal_app().get_authorization_request_url(
+        scopes=scopes or ["User.Read"],
+        state=state,
+        redirect_uri=os.getenv("ENTRA_REDIRECT_URI"),
+        prompt="select_account",
+    )
 
 # =============================================================================
 # Templates
 # =============================================================================
-BASE = """
-<!doctype html>
-<html>
+BASE = """<!doctype html>
+<html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>{{title}}</title>
+  <title>{{ title }}</title>
+
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
-<body class="bg-light">
+
+<body>
+
 <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
   <div class="container">
-    <a class="navbar-brand" href="{{ url_for('home') }}">Secure Uploader</a>
+    <a class="navbar-brand" href="{{ url_for('login') }}">Secure Uploader</a>
+
     <div class="ms-auto">
-      {% if g.user %}
-        <span class="text-white me-3">Hi, {{g.user.username}}</span>
+      {% if session.get('user_id') %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('files') }}">Files</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('upload') }}">Upload</a>
-        {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('incidents') }}">Incidents</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('maintenance_personnel') }}">Maintenance</a>
         {% if g.user.role == 'admin' %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('backups') }}">Backups</a>
         {% endif %}
-        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('add_user') }}">Add User</a>
-        {% endif %}
-        <a class="btn btn-sm btn-warning" href="{{ url_for('logout') }}">Logout</a>
+        <a class="btn btn-sm btn-outline-light" href="{{ url_for('logout') }}">Logout</a>
       {% else %}
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('login') }}">Login</a>
-        {% if signup_enabled %}
-        <a class="btn btn-sm btn-light" href="{{ url_for('signup') }}">Sign Up</a>
-        {% endif %}
       {% endif %}
     </div>
   </div>
 </nav>
 
 <div class="container py-4">
+
   {% with messages = get_flashed_messages() %}
     {% if messages %}
       <div class="alert alert-info">
-        {% for m in messages %}<div>{{m}}</div>{% endfor %}
+        {% for m in messages %}
+          <div>{{ m }}</div>
+        {% endfor %}
       </div>
     {% endif %}
   {% endwith %}
+
   {{ body|safe }}
+
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
 </body>
 </html>
 """
+
 
 def page(title: str, body: str):
     return render_template_string(BASE, title=title, body=body, signup_enabled=SIGNUP_ENABLED)
@@ -489,6 +609,41 @@ def page(title: str, body: str):
 # =============================================================================
 # Routes
 # =============================================================================
+
+SIGNUP_FORM = """
+<div class="row justify-content-center">
+  <div class="col-md-6">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h3 class="card-title">Sign Up</h3>
+        <p class="text-muted">Create a standard user account.</p>
+        <form method="post">
+          <div class="mb-3">
+            <label class="form-label">Username</label>
+            <input class="form-control" name="username" value="{{ username }}" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Password</label>
+            <input class="form-control" type="password" name="password" required>
+            <div class="form-text">12+ chars, upper/lower/number/special.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Confirm Password</label>
+            <input class="form-control" type="password" name="confirm" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Signup Code</label>
+            <input class="form-control" name="signup_code" value="{{ signup_code }}" required>
+          </div>
+          <button class="btn btn-primary">Create Account</button>
+          <a class="btn btn-link" href="/login">Login</a>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
 @app.route("/")
 def home():
     if not session.get("seen_onboarding"):
@@ -577,13 +732,94 @@ def finish_onboarding():
     session["seen_onboarding"] = True
     return redirect("/signup")
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def parse_iso_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+def get_max_failed_attempts():
+    try:
+        return int(os.getenv("MAX_FAILED_ATTEMPTS", "3"))
+    except ValueError:
+        return 3
+
+def get_lockout_minutes():
+    try:
+        return int(os.getenv("LOCKOUT_MINUTES", "1"))
+    except ValueError:
+        return 1
+
+def is_account_locked(user_row):
+    locked_until = parse_iso_dt(user_row["locked_until"])
+    if not locked_until:
+        return False
+    return locked_until > utc_now()
+
+def clear_lockout_state(conn, user_id):
+    conn.execute("""
+        UPDATE users
+        SET failed_login_count = 0,
+            last_failed_login = NULL,
+            locked_until = NULL
+        WHERE id = ?
+    """, (user_id,))
+    conn.commit()
+
+def record_failed_login(conn, user_row):
+    current_count = int(user_row["failed_login_count"] or 0) + 1
+    now = utc_now()
+    locked_until = None
+
+    if current_count >= get_max_failed_attempts():
+        locked_until = (now + timedelta(minutes=get_lockout_minutes())).isoformat()
+
+    conn.execute("""
+        UPDATE users
+        SET failed_login_count = ?,
+            last_failed_login = ?,
+            locked_until = ?
+        WHERE id = ?
+    """, (
+        current_count,
+        now.isoformat(),
+        locked_until,
+        user_row["id"]
+    ))
+    conn.commit()
 
 @app.route("/login", methods=["GET", "POST"])
-@login_limit
 def login():
-    if request.method == "POST":
-        username = (request.form.get("username") or "").strip()
-        password = request.form.get("password") or ""
+    if request.method == "GET":
+        body = """
+        <div class="row justify-content-center">
+          <div class="col-md-6">
+            <div class="card shadow-sm">
+              <div class="card-body">
+                <h3 class="card-title">Login</h3>
+                <form method="post" action="/login">
+                  <div class="mb-3">
+                    <label class="form-label">Username</label>
+                    <input class="form-control" type="text" name="username" required>
+                  </div>
+                  <div class="mb-3">
+                    <label class="form-label">Password</label>
+                    <input class="form-control" type="password" name="password" required>
+                  </div>
+                  <button class="btn btn-primary" type="submit">Log in</button>
+                  <a class="btn btn-link" href="/forgot-password">Forgot Password?</a>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
+        return page("Login", body)
 
         conn = db_connect()
         row = conn.execute(
@@ -591,16 +827,22 @@ def login():
             (username,)
         ).fetchone()
         conn.close()
+        flash("Invalid username or password.")
+        return render_template("login.html")
 
-        if not row:
-            flash("Invalid username or password.")
-            return redirect(url_for("login"))
+    if is_account_locked(row):
+        conn.close()
+        flash("Account is temporarily locked due to repeated failed login attempts. Please try again later.")
+        return render_template("login.html")
 
-        try:
-            ph.verify(row["password_hash"], password)
-        except VerifyMismatchError:
-            flash("Invalid username or password.")
-            return redirect(url_for("login"))
+    try:
+        ph.verify(row["password_hash"], password)
+    except VerifyMismatchError:
+        record_failed_login(conn, row)
+        conn.close()
+        log_event(row["id"], username, "LOGIN", status="FAIL")
+        flash("Invalid username or password.")
+        return render_template("login.html")
 
         session["user_id"] = row["id"]
         session['session_id'] = str(uuid.uuid4())
@@ -616,33 +858,48 @@ def login():
               return redirect(url_for("onboarding"))
         return redirect(url_for("files"))
 
-    body = render_template_string("""
-    <div class="row justify-content-center">
-      <div class="col-md-6">
-        <div class="card shadow-sm">
-          <div class="card-body">
-            <h3 class="card-title">Login</h3>
-            <form method="post">
-              <div class="mb-3">
-                <label class="form-label">Username</label>
-                <input class="form-control" name="username" required>
-              </div>
-              <div class="mb-3">
-                <label class="form-label">Password</label>
-                <input class="form-control" type="password" name="password" required>
-              </div>
-              <button class="btn btn-primary">Log in</button>
-              <a class="btn btn-link" href="/">Home</a>
-              {% if signup_enabled %}
-              <a class="btn btn-link" href="/signup">Sign Up</a>
-              {% endif %}
-            </form>
-          </div>
-        </div>
-      </div>
-    </div>
-    """, signup_enabled=SIGNUP_ENABLED)
-    return render_template_string(BASE, title="Login", body=body, signup_enabled=SIGNUP_ENABLED)
+    session.permanent = True
+    session["user_id"] = row["id"]
+    flash("Logged in successfully.")
+
+    if not session.get("seen_onboarding"):
+        return redirect(url_for("onboarding"))
+
+    return redirect(url_for("files"))
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    if request.args.get("state") != session.get("auth_state"):
+        abort(400, "State mismatch")
+
+    if "error" in request.args:
+        return f"Login failed: {request.args.get('error_description', request.args.get('error'))}", 400
+
+    code = request.args.get("code")
+    if not code:
+        return "Missing authorization code.", 400
+
+    result = build_msal_app().acquire_token_by_authorization_code(
+        code,
+        scopes=["User.Read"],
+        redirect_uri=os.getenv("ENTRA_REDIRECT_URI"),
+    )
+
+    if "error" in result:
+        return f"Token error: {result.get('error_description', result.get('error'))}", 400
+
+    claims = result.get("id_token_claims", {})
+
+    session.clear()
+    session["user_id"] = claims.get("oid") or claims.get("sub")
+    session["username"] = claims.get("preferred_username") or claims.get("email") or claims.get("name")
+    session["role"] = "User"
+
+    flash("Logged in successfully.")
+    if not session.get("seen_onboarding"):
+        return redirect(url_for("onboarding"))
+    return redirect(url_for("files"))
 
 @app.route("/signup", methods=["GET", "POST"])
 @signup_limit
@@ -650,28 +907,40 @@ def signup():
     if not SIGNUP_ENABLED:
         abort(404)
 
+    # Store form values (except passwords)
+    form_data = {
+        "username": "",
+        "signup_code": ""
+    }
+
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         confirm = request.form.get("confirm") or ""
         signup_code = (request.form.get("signup_code") or "").strip()
 
+        # Save values to persist in form
+        form_data["username"] = username
+        form_data["signup_code"] = signup_code
+
+        # --- VALIDATION ---
         if not username or not password or not confirm or not signup_code:
             flash("All fields are required.")
-            return redirect(url_for("signup"))
+            return page("Sign Up", render_template_string(SIGNUP_FORM, **form_data))
 
         if password != confirm:
-            flash("Passwords do not match.")
-            return redirect(url_for("signup"))
+            flash("Passwords do not match. Enter a new password.")
+            return page("Sign Up", render_template_string(SIGNUP_FORM, **form_data))
 
         if not valid_password(password):
             flash("Password must be 12+ chars with upper, lower, number, and special character.")
-            return redirect(url_for("signup"))
+            return page("Sign Up", render_template_string(SIGNUP_FORM, **form_data))
 
         if not SIGNUP_CODE or signup_code != SIGNUP_CODE:
             flash("Invalid signup code.")
-            return redirect(url_for("signup"))
+            return page("Sign Up", render_template_string(SIGNUP_FORM, **form_data))
 
+        # --- CHECK USER ---
         conn = db_connect()
         existing = conn.execute(
             "SELECT id FROM users WHERE username=?",
@@ -681,8 +950,9 @@ def signup():
         if existing:
             conn.close()
             flash("Username already exists.")
-            return redirect(url_for("signup"))
+            return page("Sign Up", render_template_string(SIGNUP_FORM, **form_data))
 
+        # --- CREATE USER ---
         password_hash = ph.hash(password)
         conn.execute(
             "INSERT INTO users(username, password_hash, role, created_at) VALUES (?,?,?,?)",
@@ -694,40 +964,7 @@ def signup():
         flash("Account created successfully. Please log in.")
         return redirect(url_for("login"))
 
-    body = """
-    <div class="row justify-content-center">
-      <div class="col-md-6">
-        <div class="card shadow-sm">
-          <div class="card-body">
-            <h3 class="card-title">Sign Up</h3>
-            <p class="text-muted">Create a standard user account.</p>
-            <form method="post">
-              <div class="mb-3">
-                <label class="form-label">Username</label>
-                <input class="form-control" name="username" required>
-              </div>
-              <div class="mb-3">
-                <label class="form-label">Password</label>
-                <input class="form-control" type="password" name="password" required>
-                <div class="form-text">12+ chars, upper/lower/number/special.</div>
-              </div>
-              <div class="mb-3">
-                <label class="form-label">Confirm Password</label>
-                <input class="form-control" type="password" name="confirm" required>
-              </div>
-              <div class="mb-3">
-                <label class="form-label">Signup Code</label>
-                <input class="form-control" name="signup_code" required>
-              </div>
-              <button class="btn btn-primary">Create Account</button>
-              <a class="btn btn-link" href="/login">Login</a>
-            </form>
-          </div>
-        </div>
-      </div>
-    </div>
-    """
-    return page("Sign Up", body)
+    return page("Sign Up", render_template_string(SIGNUP_FORM, **form_data))
 
 @app.route("/logout")
 def logout():
@@ -876,7 +1113,7 @@ def upload():
                 stored_name,
                 mime,
                 len(file_bytes),
-                datetime.datetime.utcnow().isoformat(),
+                datetime.utcnow().isoformat(),
                 int(g.user["id"]),
                 1 if client_encrypted else 0,
             )
@@ -908,6 +1145,7 @@ def upload():
     """
     return page("Upload", body)
 
+
 @app.route("/files")
 @login_required
 def files():
@@ -915,47 +1153,151 @@ def files():
     conn = db_connect()
 
     if is_admin():
-        rows = conn.execute(
-            "SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted FROM files ORDER BY uploaded_at DESC"
+        owned_rows = conn.execute(
+            """
+            SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted
+            FROM files
+            ORDER BY uploaded_at DESC
+            """
         ).fetchall()
+        shared_rows = []
     else:
-        rows = conn.execute(
-            "SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted FROM files WHERE owner_id=? ORDER BY uploaded_at DESC",
+        owned_rows = conn.execute(
+            """
+            SELECT id, filename, orig_name, stored_name, mime, size, uploaded_at, owner_id, client_encrypted
+            FROM files
+            WHERE owner_id=?
+            ORDER BY uploaded_at DESC
+            """,
+            (uid,)
+        ).fetchall()
+
+        shared_rows = conn.execute(
+            """
+            SELECT
+                f.id,
+                f.filename,
+                f.orig_name,
+                f.stored_name,
+                f.mime,
+                f.size,
+                f.uploaded_at,
+                f.owner_id,
+                f.client_encrypted,
+                fa.can_read,
+                fa.can_delete,
+                fa.can_share,
+                u.username AS owner_username
+            FROM file_access fa
+            JOIN files f ON fa.file_id = f.id
+            JOIN users u ON u.id = f.owner_id
+            WHERE fa.user_id=? AND fa.can_read=1
+            ORDER BY f.uploaded_at DESC
+            """,
             (uid,)
         ).fetchall()
 
     conn.close()
 
-    lines = []
-    lines.append("<h3>Your Files</h3>")
-    lines.append("<div class='table-responsive'><table class='table table-striped'>")
-    lines.append("<thead><tr><th>Name</th><th>Size</th><th>Uploaded</th><th>Encrypted</th><th>Actions</th></tr></thead><tbody>")
+    body = render_template_string(
+        """
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <div>
+            <h3 class="mb-1">Files</h3>
+            <p class="text-muted mb-0">View your uploaded files and files shared with you.</p>
+          </div>
+          <a class="btn btn-primary" href="{{ url_for('upload') }}">Upload File</a>
+        </div>
 
-    for r in rows:
-        name = r["orig_name"] or r["filename"] or "unknown"
-        enc = "Client" if int(r["client_encrypted"]) == 1 else "Server"
-        lines.append(
-            "<tr>"
-            f"<td>{name}</td>"
-            f"<td>{int(r['size'])} bytes</td>"
-            f"<td>{r['uploaded_at']}</td>"
-            f"<td>{enc}</td>"
-            f"<td>"
-            f"<a class='btn btn-sm btn-outline-primary me-2' href='/download/{r['id']}'>Download</a>"
-            f"<a class='btn btn-sm btn-outline-danger me-2' href='/delete/{r['id']}'>Delete</a>"
-            f"<form method='post' action='/share/{r['id']}' style='display:inline;'>"
-            f"<input name='username' placeholder='username' style='width:120px;font-size:12px;'>"
-            f"<button class='btn btn-sm btn-outline-secondary'>Share</button>"
-            f"</form>"
-            f"</td>"
-            "</tr>"
-        )
+        <div class="card shadow-sm mb-4">
+          <div class="card-body">
+            <h4 class="h5">My Uploaded Files</h4>
+            {% if owned_rows %}
+              <div class="table-responsive">
+                <table class="table table-striped align-middle">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Size</th>
+                      <th>Uploaded</th>
+                      <th>Encryption</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for r in owned_rows %}
+                      <tr>
+                        <td>{{ r["orig_name"] or r["filename"] or "unknown" }}</td>
+                        <td>{{ r["size"] }} bytes</td>
+                        <td>{{ r["uploaded_at"] }}</td>
+                        <td>{{ "Client" if r["client_encrypted"] == 1 else "Server" }}</td>
+                        <td>
+                          <a class="btn btn-sm btn-outline-primary me-2" href="{{ url_for('download', file_id=r['id']) }}">Download</a>
+                          <a class="btn btn-sm btn-outline-danger me-2" href="{{ url_for('delete', file_id=r['id']) }}">Delete</a>
 
-    lines.append("</tbody></table></div>")
-    body = "\n".join(lines)
+                          <form method="post" action="{{ url_for('share_file', file_id=r['id']) }}" class="d-inline-flex gap-1 align-items-center flex-wrap">
+                            <input class="form-control form-control-sm" name="username" placeholder="username" style="width:130px;" required>
+                            <input class="form-control form-control-sm" name="share_password" type="password" placeholder="share password" style="width:150px;" required>
+                            <button class="btn btn-sm btn-outline-secondary">Share</button>
+                          </form>
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            {% else %}
+              <p class="text-muted mb-0">You have not uploaded any files yet.</p>
+            {% endif %}
+          </div>
+        </div>
+
+        {% if not is_admin_user %}
+        <div class="card shadow-sm">
+          <div class="card-body">
+            <h4 class="h5">Files Shared With Me</h4>
+            {% if shared_rows %}
+              <div class="table-responsive">
+                <table class="table table-striped align-middle">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Shared By</th>
+                      <th>Size</th>
+                      <th>Uploaded</th>
+                      <th>Encryption</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for r in shared_rows %}
+                      <tr>
+                        <td>{{ r["orig_name"] or r["filename"] or "unknown" }}</td>
+                        <td>{{ r["owner_username"] }}</td>
+                        <td>{{ r["size"] }} bytes</td>
+                        <td>{{ r["uploaded_at"] }}</td>
+                        <td>{{ "Client" if r["client_encrypted"] == 1 else "Server" }}</td>
+                        <td>
+                          <a class="btn btn-sm btn-outline-primary" href="{{ url_for('download', file_id=r['id']) }}">Download</a>
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            {% else %}
+              <p class="text-muted mb-0">No files have been shared with you yet.</p>
+            {% endif %}
+          </div>
+        </div>
+        {% endif %}
+        """,
+        owned_rows=owned_rows,
+        shared_rows=shared_rows,
+        is_admin_user=is_admin(),
+    )
+
     return page("Files", body)
-    return render_template_string(BASE, title="Files", body=body)
-
 
 @app.route("/incidents", methods=["GET", "POST"])
 @login_required
@@ -972,7 +1314,7 @@ def incidents():
             flash("Title and description are required.")
             return redirect(url_for("incidents"))
 
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.utcnow().isoformat()
         conn = db_connect()
         conn.execute(
             """
@@ -1165,7 +1507,7 @@ def handle_incident(incident_id: int):
         conn.close()
         abort(404)
 
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
     conn.execute(
         """
         INSERT INTO incident_actions(incident_id, action_note, status_after, action_by, action_at)
@@ -1212,7 +1554,7 @@ def backups():
                     backup_info["name"],
                     backup_info["path"].name,
                     int(backup_info["size"]),
-                    datetime.datetime.utcnow().isoformat(),
+                    datetime.utcnow().isoformat(),
                     int(g.user["id"]),
                     1 if backup_info["is_encrypted"] else 0,
                     backup_info["encryption_method"],
@@ -1339,41 +1681,114 @@ def download_backup(backup_id: int):
         download_name=row["backup_name"],
         mimetype="application/octet-stream",
     )
-
-
-@app.route("/download/<int:file_id>")
+@app.route("/download/<int:file_id>", methods=["GET", "POST"])
 @login_required
 def download(file_id: int):
     conn = db_connect()
-    row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-    conn.close()
+
+    row = conn.execute(
+        "SELECT * FROM files WHERE id=?",
+        (file_id,)
+    ).fetchone()
 
     if not row:
+        conn.close()
         abort(404)
 
     uid = int(g.user["id"])
-    if not is_admin() and int(row["owner_id"]) != uid:
-        abort(403)
+    is_owner_or_admin = is_admin() or int(row["owner_id"]) == uid
+
+    shared_access = None
+    if not is_owner_or_admin:
+        shared_access = conn.execute(
+            """
+            SELECT can_read, can_delete, can_share, share_password_hash
+            FROM file_access
+            WHERE file_id=? AND user_id=?
+            """,
+            (file_id, uid)
+        ).fetchone()
+
+        if not shared_access or int(shared_access["can_read"]) != 1:
+            conn.close()
+            abort(403)
+
+    if not is_owner_or_admin:
+        session_key = f"shared_download_ok_{file_id}"
+
+        if request.method == "POST":
+            entered_password = request.form.get("share_password") or ""
+            if not entered_password:
+                conn.close()
+                flash("Share password is required.")
+                return redirect(url_for("download", file_id=file_id))
+
+            try:
+                ph.verify(shared_access["share_password_hash"], entered_password)
+                session[session_key] = True
+            except VerifyMismatchError:
+                conn.close()
+                flash("Incorrect share password.")
+                return redirect(url_for("download", file_id=file_id))
+
+        elif not session.get(session_key):
+            orig_name = row["orig_name"] or row["filename"] or "download.bin"
+            conn.close()
+            body = render_template_string(
+                """
+                <div class="row justify-content-center">
+                  <div class="col-md-6">
+                    <div class="card shadow-sm">
+                      <div class="card-body">
+                        <h3 class="card-title">Shared File Access</h3>
+                        <p class="text-muted">Enter the share password to download <strong>{{ filename }}</strong>.</p>
+                        <form method="post">
+                          <div class="mb-3">
+                            <label class="form-label">Share Password</label>
+                            <input class="form-control" type="password" name="share_password" required>
+                          </div>
+                          <button class="btn btn-primary">Verify & Download</button>
+                          <a class="btn btn-link" href="{{ url_for('files') }}">Back</a>
+                        </form>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                """,
+                filename=orig_name
+            )
+            return page("Enter Share Password", body)
+
+    conn.close()
 
     stored_name = row["stored_name"]
     orig_name = row["orig_name"] or row["filename"] or "download.bin"
+    mime = row["mime"] or "application/octet-stream"
     client_encrypted = int(row["client_encrypted"]) == 1
-
-    if not blob_exists(stored_name):
-        abort(404)
 
     try:
         data = download_blob_bytes(stored_name)
-    except Exception:
+    except FileNotFoundError:
+        app.logger.error(f"Download failed: file not found for stored_name={stored_name}")
         abort(404)
+    except Exception as e:
+        app.logger.exception(f"Download failed for stored_name={stored_name}: {e}")
+        abort(500)
 
     if not client_encrypted:
-        data = decrypt_bytes(data, ENC_KEY_B64)
+        try:
+            data = decrypt_bytes(data, ENC_KEY_B64)
+        except Exception as e:
+            app.logger.exception(f"Decryption failed for file_id={file_id}: {e}")
+            abort(500)
+
+    session.pop(f"shared_download_ok_{file_id}", None)
 
     return send_file(
         io.BytesIO(data),
         as_attachment=True,
         download_name=orig_name,
+        mimetype=mime,
     )
 
 @app.route("/delete/<int:file_id>")
@@ -1399,6 +1814,7 @@ def delete(file_id: int):
     except Exception:
         pass
 
+    conn.execute("DELETE FROM file_access WHERE file_id=?", (file_id,))
     conn.execute("DELETE FROM files WHERE id=?", (file_id,))
     conn.commit()
     conn.close()
@@ -1406,17 +1822,36 @@ def delete(file_id: int):
     flash("Deleted.")
     return redirect(url_for("files"))
 
+def user_can_share_file(user_id, file_id, is_admin=False):
+    if is_admin:
+        return True
+
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id, owner_id FROM files WHERE id = ?",
+            (file_id,)
+        ).fetchone()
+
+        if not row:
+            return False
+
+        return int(row["owner_id"]) == int(user_id)
+    finally:
+        conn.close()
+
+
 @app.route("/share/<int:file_id>", methods=["POST"])
 @login_required
 def share_file(file_id):
-    is_admin = (g.user.get("role") == "admin")
+    is_admin_user = (g.user.get("role") == "admin")
 
-    if not user_can_share_file(g.user["id"], file_id, is_admin=is_admin):
+    if not user_can_share_file(g.user["id"], file_id, is_admin=is_admin_user):
         log_event(g.user["id"], g.user["username"], "share", str(file_id), "DENY")
         abort(403)
 
     target_username = (request.form.get("username") or "").strip()
-    message = (request.form.get("message") or "").strip()
+    share_password = request.form.get("share_password") or ""
     can_delete = 1 if (request.form.get("can_delete") == "1") else 0
     can_share = 1 if (request.form.get("can_share") == "1") else 0
 
@@ -1424,8 +1859,26 @@ def share_file(file_id):
         flash("Username is required to share.")
         return redirect(url_for("files"))
 
+    if not share_password:
+        flash("A share password is required.")
+        return redirect(url_for("files"))
+
+    if len(share_password) < 8:
+        flash("Share password must be at least 8 characters.")
+        return redirect(url_for("files"))
+
     conn = db_connect()
     c = conn.cursor()
+
+    file_row = c.execute(
+        "SELECT id, owner_id FROM files WHERE id=?",
+        (file_id,)
+    ).fetchone()
+
+    if not file_row:
+        conn.close()
+        flash("File not found.")
+        return redirect(url_for("files"))
 
     c.execute("SELECT id FROM users WHERE username=?", (target_username,))
     dest = c.fetchone()
@@ -1435,12 +1888,22 @@ def share_file(file_id):
         flash("Target user not found.")
         return redirect(url_for("files"))
 
-    target_id = int(dest[0])
+    target_id = int(dest["id"] if isinstance(dest, sqlite3.Row) else dest[0])
 
-    c.execute("""
-        INSERT OR REPLACE INTO file_access(file_id, user_id, can_read, can_delete, can_share)
-        VALUES (?,?,?,?,?)
-    """, (file_id, target_id, 1, can_delete, can_share))
+    if target_id == int(g.user["id"]):
+        conn.close()
+        flash("You cannot share a file with yourself.")
+        return redirect(url_for("files"))
+
+    share_password_hash = ph.hash(share_password)
+
+    c.execute(
+        """
+        INSERT OR REPLACE INTO file_access(file_id, user_id, can_read, can_delete, can_share, share_password_hash)
+        VALUES (?,?,?,?,?,?)
+        """,
+        (file_id, target_id, 1, can_delete, can_share, share_password_hash)
+    )
 
     conn.commit()
     conn.close()
@@ -1451,10 +1914,10 @@ def share_file(file_id):
         "share",
         str(file_id),
         "SUCCESS",
-        {"to": target_username, "can_delete": can_delete, "can_share": can_share}
+        {"to": target_username, "password_protected": True}
     )
 
-    flash(f"File shared with {target_username}.")
+    flash(f"File shared securely with {target_username}. They will need the share password to download it.")
     return redirect(url_for("files"))
 
 
