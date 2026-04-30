@@ -33,6 +33,7 @@ dist/
 .vs/
 .vscode/
 .idea/
+.claude/
 
 # Logs
 *.log
