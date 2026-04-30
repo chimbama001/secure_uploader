@@ -68,9 +68,9 @@
             <li class="nav-item"><a class="nav-link" href="{{ url_for('inbox') }}">Inbox</a></li>
             <li class="nav-item"><a class="nav-link" href="{{ url_for('add_user_form') }}">Add User</a></li>
             {% if session.get("role") == "admin" %}
-            <li class="nav-item">
-            <a class="nav-link" href="/users">Users</a>
-            </li>
+              <li class="nav-item"><a class="nav-link" href="{{ url_for('active_sessions_view') }}">Active Sessions</a></li>
+              <li class="nav-item"><a class="nav-link" href="{{ url_for('audit_logs_view') }}">Audit Logs</a></li>
+              <li class="nav-item"><a class="nav-link" href="/users">Users</a></li>
             {% endif %}
             <li class="nav-item d-flex align-items-center ms-3">
               {% if ENCRYPTION_AVAILABLE %}

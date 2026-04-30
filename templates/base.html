@@ -53,41 +53,39 @@
         </button>
 
         <div class="collapse navbar-collapse" id="navMenu">
-            <ul class="navbar-nav ms-auto">
-
-                <li class="nav-item">
-                    <a class="nav-link" href="{{ url_for('files') }}">Files</a>
-                </li>
-
-                <li class="nav-item">
-                    <a class="nav-link" href="{{ url_for('upload') }}">Upload</a>
-                </li>
-
-                <li class="nav-item d-flex align-items-center ms-3">
-                    {% if ENCRYPTION_AVAILABLE %}
-                        <span class="nav-link secure-lock locked">Secure</span>
-                    {% else %}
-                        <span class="nav-link secure-lock unlocked">Not Secure</span>
-                    {% endif %}
-                </li>
-
-                {% if g.user %}
-                    <li class="nav-item">
-                        <span class="nav-link">{{ g.user.username }}</span>
-                    </li>
-
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('logout') }}">Logout</a>
-                    </li>
-                {% else %}
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('login') }}">Login</a>
-                    </li>
-
-                    <li class="nav-item">
-                        <a class="nav-link" href="{{ url_for('signup') }}">Sign Up</a>
-                    </li>
-                {% endif %}
+          <ul class="navbar-nav ms-auto">
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('upload') }}">Upload</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('files') }}">Files</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('inbox') }}">Inbox</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('add_user_form') }}">Add User</a></li>
+            {% if is_admin() %}
+              <li class="nav-item"><a class="nav-link" href="{{ url_for('active_sessions_view') }}">Active Sessions</a></li>
+              <li class="nav-item"><a class="nav-link" href="{{ url_for('audit_logs') }}">Audit Logs</a></li>
+              <li class="nav-item"><a class="nav-link" href="{{ url_for('backups') }}">Backups</a></li>
+            {% endif %}
+            <li class="nav-item d-flex align-items-center ms-3">
+              {% if ENCRYPTION_AVAILABLE %}
+                <div class="secure-lock locked" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Server encryption enabled — files are encrypted at rest.">
+                  <svg class="lock-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 15a1.5 1.5 0 100-3 1.5 1.5 0 000 3z" fill="currentColor"/><path d="M7 10V8a5 5 0 1110 0v2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><rect x="4" y="10" width="16" height="10" rx="2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <span class="d-none d-lg-inline">Secure</span>
+                </div>
+              {% else %}
+                <div class="secure-lock unlocked" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Server encryption not configured — consider setting UPLOAD_ENC_KEY.">
+                  <svg class="lock-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 10V8a5 5 0 0110 0v2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><rect x="4" y="10" width="16" height="10" rx="2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <span class="d-none d-lg-inline">Not Secure</span>
+                </div>
+              {% endif %}
+            </li>
+            {% if g.user %}
+              <li class="nav-item"><span class="nav-link">{{ g.user.username }}</span></li>
+              <li class="nav-item"><a class="nav-link" href="{{ url_for('logout') }}">Logout</a></li>
+            {% else %}
+              <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
+            {% endif %}
+          </ul>
+        </div>
+      </div>
+    </nav>
 
             </ul>
         </div>
