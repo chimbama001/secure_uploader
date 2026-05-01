@@ -7,6 +7,12 @@
     <h2>Audit Logs</h2>
   </div>
 
+  <form method="get" class="mb-3 d-flex gap-2" style="max-width:400px;">
+    <input class="form-control" type="text" name="q" value="{{ q }}" placeholder="Search by username…">
+    <button class="btn btn-outline-secondary" type="submit">Search</button>
+    {% if q %}<a class="btn btn-outline-danger" href="{{ url_for('audit_logs') }}">Clear</a>{% endif %}
+  </form>
+
   {% if logs %}
     <div class="card">
       <div class="table-responsive">
