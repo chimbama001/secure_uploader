@@ -89,8 +89,6 @@ Standard User:
 
 ---
 
-## 8. SSP Update Frequency
-
 ## 8. SSP Review and Update Policy
 
 The SecureVault System Security Plan (SSP) is reviewed at least annually and whenever significant changes occur to:
