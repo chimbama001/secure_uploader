@@ -1,0 +1,196 @@
+{% extends 'base.html' %}
+
+{% block title %}Users - Secure Uploader{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2>Users</h2>
+</div>
+
+<form method="get" class="mb-3 d-flex gap-2" style="max-width:400px;">
+  <input class="form-control" type="text" name="q" value="{{ q }}" placeholder="Search by username…">
+  <button class="btn btn-outline-secondary" type="submit">Search</button>
+  {% if q %}<a class="btn btn-outline-danger" href="{{ url_for('users_view') }}">Clear</a>{% endif %}
+</form>
+
+{% if users %}
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-striped mb-0 card-table align-middle">
+      <thead class="table-light">
+        <tr>
+          <th>Username</th>
+          <th>Type</th>
+          <th>Created</th>
+          <th>Online</th>
+          <th>Account Status</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for u in users %}
+        <tr>
+          <td><strong>{{ u.username }}</strong></td>
+          <td>
+            <div class="d-flex gap-1 flex-wrap">
+              {% if u.role == 'admin' %}
+                <span class="badge bg-primary">Admin</span>
+              {% else %}
+                <span class="badge bg-secondary">User</span>
+              {% endif %}
+              {% if u.is_maintenance %}
+                <span class="badge bg-info text-dark">Maintenance</span>
+              {% endif %}
+            </div>
+          </td>
+          <td><small>{{ u.created_at[:10] }}</small></td>
+          <td>
+            {% if u.online %}
+              <span class="badge bg-success">Online</span>
+            {% else %}
+              <span class="badge bg-light text-dark border">Offline</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if u.status == 'active' %}
+              <span class="badge bg-success">Active</span>
+            {% elif u.status == 'paused' %}
+              <span class="badge bg-warning text-dark">Paused</span>
+            {% elif u.status == 'disabled' %}
+              <span class="badge bg-danger">Disabled</span>
+            {% elif u.status == 'transfer_review' %}
+              <span class="badge bg-warning text-dark">Pending Transfer Review</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="d-flex gap-2 flex-wrap">
+
+              {% if u.status in ('active', 'paused', 'transfer_review') %}
+                <!-- Transfer button -->
+                <button class="btn btn-sm btn-outline-info"
+                        data-bs-toggle="modal"
+                        data-bs-target="#transferModal{{ u.id }}">
+                  Transfer
+                </button>
+              {% endif %}
+
+              {% if u.status != 'disabled' %}
+                <!-- Disable button -->
+                <button class="btn btn-sm btn-outline-danger"
+                        data-bs-toggle="modal"
+                        data-bs-target="#disableModal{{ u.id }}">
+                  Disable
+                </button>
+              {% endif %}
+
+              {% if u.status in ('disabled', 'transfer_review', 'paused') %}
+                <!-- Enable modal trigger -->
+                <button class="btn btn-sm btn-outline-success"
+                        data-bs-toggle="modal"
+                        data-bs-target="#enableModal{{ u.id }}">
+                  Enable
+                </button>
+              {% endif %}
+
+            </div>
+          </td>
+        </tr>
+
+        <!-- Disable Modal -->
+        <div class="modal fade" id="disableModal{{ u.id }}" tabindex="-1">
+          <div class="modal-dialog">
+            <div class="modal-content">
+              <div class="modal-header">
+                <h5 class="modal-title">Disable Account — {{ u.username }}</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+              </div>
+              <form method="post" action="{{ url_for('disable_user', user_id=u.id) }}">
+                <div class="modal-body">
+                  <div class="mb-3">
+                    <label class="form-label fw-semibold">Personnel Action</label>
+                    <select class="form-select" name="personnel_action">
+                      <option value="">— select if applicable —</option>
+                      <option value="termination">Termination</option>
+                      <option value="resignation">Resignation</option>
+                      <option value="contract_end">Contract End</option>
+                      <option value="policy_violation">Policy Violation</option>
+                      <option value="other">Other</option>
+                    </select>
+                  </div>
+                  <div class="mb-3">
+                    <label class="form-label fw-semibold">Reason <span class="text-danger">*</span></label>
+                    <textarea class="form-control" name="reason" rows="3" required
+                      placeholder="Why is this account being disabled?"></textarea>
+                  </div>
+                </div>
+                <div class="modal-footer">
+                  <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                  <button type="submit" class="btn btn-danger">Disable Account</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <!-- Transfer Modal -->
+        <div class="modal fade" id="transferModal{{ u.id }}" tabindex="-1">
+          <div class="modal-dialog">
+            <div class="modal-content">
+              <div class="modal-header">
+                <h5 class="modal-title">Initiate Transfer — {{ u.username }}</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+              </div>
+              <form method="post" action="{{ url_for('transfer_user', user_id=u.id) }}">
+                <div class="modal-body">
+                  <div class="alert alert-warning mb-3">
+                    This will pause the account, revoke maintenance access, and flag it for access review.
+                  </div>
+                  <div class="mb-3">
+                    <label class="form-label fw-semibold">Reason / Transfer Details <span class="text-danger">*</span></label>
+                    <textarea class="form-control" name="reason" rows="3" required
+                      placeholder="e.g. Moving to new department, role change, etc."></textarea>
+                  </div>
+                </div>
+                <div class="modal-footer">
+                  <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                  <button type="submit" class="btn btn-warning">Initiate Transfer</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <!-- Enable Modal -->
+        <div class="modal fade" id="enableModal{{ u.id }}" tabindex="-1">
+          <div class="modal-dialog">
+            <div class="modal-content">
+              <div class="modal-header">
+                <h5 class="modal-title">Enable Account — {{ u.username }}</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+              </div>
+              <form method="post" action="{{ url_for('enable_user', user_id=u.id) }}">
+                <div class="modal-body">
+                  <div class="mb-3">
+                    <label class="form-label fw-semibold">Reason <span class="text-danger">*</span></label>
+                    <textarea class="form-control" name="reason" rows="2" required
+                      placeholder="Why is access being restored?"></textarea>
+                  </div>
+                </div>
+                <div class="modal-footer">
+                  <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                  <button type="submit" class="btn btn-success">Enable Account</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+  <div class="alert alert-info">No users found.</div>
+{% endif %}
+{% endblock %}

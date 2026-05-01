@@ -21,7 +21,11 @@ from werkzeug.utils import secure_filename
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from azure.storage.blob import BlobServiceClient
-from kv_crypto import encrypt_file_with_keyvault, decrypt_file_with_keyvault
+try:
+    from kv_crypto import encrypt_file_with_keyvault, decrypt_file_with_keyvault
+except Exception:
+    encrypt_file_with_keyvault = None
+    decrypt_file_with_keyvault = None
 
 try:
     from flask_limiter import Limiter
@@ -35,12 +39,12 @@ from backup_utils import BACKUP_ENCRYPTION_METHOD, create_protected_backup, load
 
 
 active_sessions = {}
+paused_sessions = set()
+terminated_sessions = set()
 
 
 def log_event(user_id, username, action, target=None, status="SUCCESS", metadata=None):
-    import sqlite3
     import json
-    from datetime import datetime
     from flask import request as _req
 
     try:
@@ -48,40 +52,35 @@ def log_event(user_id, username, action, target=None, status="SUCCESS", metadata
     except RuntimeError:
         ip_address = None
 
-    details = {}
-    if target:
-        details["target"] = target
-    if status:
-        details["status"] = status
+    metadata_str = None
     if metadata:
         if isinstance(metadata, dict):
-            details.update(metadata)
+            metadata_str = json.dumps(metadata)
         else:
-            details["metadata"] = str(metadata)
+            metadata_str = str(metadata)
 
     try:
         conn = sqlite3.connect("files.db")
         conn.row_factory = sqlite3.Row
-
         conn.execute(
             """
             INSERT INTO audit_logs
-            (event_type, username, user_id, ip_address, details, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (timestamp, username, user_id, ip_address, action, target, status, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                action,
+                datetime.utcnow().isoformat(),
                 username,
                 user_id,
                 ip_address,
-                json.dumps(details) if details else None,
-                datetime.utcnow().isoformat()
+                action,
+                target,
+                status,
+                metadata_str,
             )
         )
-
         conn.commit()
         conn.close()
-
     except Exception as e:
         print("Audit logging failed:", e)
 
@@ -123,21 +122,6 @@ DB_PATH = os.path.join(DATA_DIR, "files.db")
 
 ph = PasswordHasher()
 
-@app.before_request
-def load_user():
-    g.user = None
-
-    if "user_id" in session:
-        conn = db_connect()
-        user = conn.execute(
-            "SELECT id, username FROM users WHERE id=?",
-            (session["user_id"],)
-        ).fetchone()
-        conn.close()
-
-        if user:
-            g.user = user
-
 if Limiter and get_remote_address:
     limiter = Limiter(
         app=app,
@@ -158,24 +142,53 @@ else:
 
 @app.before_request
 def update_activity():
-    if 'user_id' in session and 'session_id' in session and session['session_id'] in active_sessions:
-        session_data = active_sessions[session['session_id']]
-        now = datetime.datetime.utcnow()
-        idle_timeout = 600  # 10 minutes of inactivity
-        
-        # Check for session expiration before updating
-        if (now - session_data['last_activity']).total_seconds() > idle_timeout:
-            active_sessions.pop(session['session_id'], None)
+    if not hasattr(g, 'user'):
+        g.user = None
+    sid = session.get('session_id')
+    if not sid or 'user_id' not in session:
+        return
+
+    if sid in terminated_sessions:
+        terminated_sessions.discard(sid)
+        session.clear()
+        flash("Your session was terminated by an administrator.")
+        return redirect(url_for('login'))
+
+    if sid in paused_sessions:
+        if request.endpoint not in ('login', 'logout', 'static'):
+            return page("Session Paused", "<div class='alert alert-warning'><strong>Your session has been paused by an administrator.</strong> Please wait or contact your admin.</div>")
+
+    # Enforce account-level status from DB
+    if request.endpoint not in ('login', 'logout', 'static'):
+        conn = db_connect()
+        user_row = conn.execute("SELECT status FROM users WHERE id=?", (session.get('user_id'),)).fetchone()
+        conn.close()
+        if user_row:
+            if user_row['status'] == 'disabled':
+                session.clear()
+                flash("Your account has been disabled. Contact an administrator.")
+                return redirect(url_for('login'))
+            if user_row['status'] == 'paused':
+                return page("Account Paused", "<div class='alert alert-warning'><strong>Your account has been paused by an administrator.</strong> Please wait or contact your admin.</div>")
+            if user_row['status'] == 'transfer_review':
+                return page("Account Under Review", "<div class='alert alert-warning'><strong>Your account has been placed under transfer review.</strong> Access is suspended pending administrator review.</div>")
+
+    if sid in active_sessions:
+        session_data = active_sessions[sid]
+        now = datetime.utcnow()
+        if (now - session_data['last_activity']).total_seconds() > 600:
+            active_sessions.pop(sid, None)
             session.clear()
             flash("Your session has expired due to inactivity.")
             return redirect(url_for('login'))
-        
-        # Update last activity if session is still valid
-        active_sessions[session['session_id']]['last_activity'] = now
+        active_sessions[sid]['last_activity'] = now
 
 @app.context_processor
-def inject_admin():
-    return {'is_admin': is_admin()}
+def inject_globals():
+    return {
+        'is_admin': is_admin(),
+        'ENCRYPTION_AVAILABLE': ENC_KEY_B64 is not None,
+    }
 
 # =============================================================================
 # Blob Storage
@@ -260,8 +273,16 @@ app.config["BACKUP_DIR"] = BACKUP_DIR
 
 
 # Encryption key for server-side encryption
-# ENC_KEY_B64 = load_backup_key()  # disabled after Key Vault migration
-  # uses env var or fallback, per your crypto_utils
+try:
+    ENC_KEY_B64 = load_backup_key()
+except ValueError:
+    import base64 as _b64
+    _key = os.urandom(32)
+    _key_str = _b64.urlsafe_b64encode(_key).decode()
+    _key_path = Path(__file__).resolve().parent / ".upload_enc_key"
+    _key_path.write_text(_key_str, encoding="utf-8")
+    ENC_KEY_B64 = _key
+    print(f"[WARNING] No UPLOAD_ENC_KEY set. Generated dev key saved to {_key_path}")
 
 
 # =============================================================================
@@ -290,7 +311,11 @@ def ensure_schema():
       username TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'user',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      failed_login_count INTEGER NOT NULL DEFAULT 0,
+      last_failed_login TEXT,
+      locked_until TEXT,
+      status TEXT NOT NULL DEFAULT 'active'
     );
     """)
 
@@ -376,12 +401,62 @@ def ensure_schema():
         "ALTER TABLE backup_records ADD COLUMN encryption_method TEXT NOT NULL DEFAULT 'AES-GCM'"
     )
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS file_access (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      file_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      can_read INTEGER NOT NULL DEFAULT 1,
+      can_delete INTEGER NOT NULL DEFAULT 0,
+      can_share INTEGER NOT NULL DEFAULT 0,
+      share_password_hash TEXT,
+      UNIQUE(file_id, user_id),
+      FOREIGN KEY(file_id) REFERENCES files(id),
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+    """)
+
     ensure_column(
-    conn,
-    "file_access",
-    "can_share",
-    "ALTER TABLE file_access ADD COLUMN can_share INTEGER NOT NULL DEFAULT 0"
+        conn,
+        "file_access",
+        "can_share",
+        "ALTER TABLE file_access ADD COLUMN can_share INTEGER NOT NULL DEFAULT 0"
     )
+    ensure_column(conn, "users", "failed_login_count",
+        "ALTER TABLE users ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "users", "last_failed_login",
+        "ALTER TABLE users ADD COLUMN last_failed_login TEXT")
+    ensure_column(conn, "users", "locked_until",
+        "ALTER TABLE users ADD COLUMN locked_until TEXT")
+    ensure_column(conn, "users", "status",
+        "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS access_termination_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_user_id INTEGER NOT NULL,
+      target_username TEXT NOT NULL,
+      action TEXT NOT NULL,
+      personnel_action TEXT,
+      reason TEXT NOT NULL,
+      performed_by_id INTEGER NOT NULL,
+      performed_by_username TEXT NOT NULL,
+      performed_at TEXT NOT NULL
+    );
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      username TEXT,
+      user_id INTEGER,
+      ip_address TEXT,
+      action TEXT NOT NULL,
+      target TEXT,
+      status TEXT,
+      metadata TEXT
+    );
+    """)
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS password_reset_requests (
@@ -469,7 +544,11 @@ def load_user():
         g.user = dict(row)
 
 def is_admin():
-    return bool(g.user) and g.user.get("role") == "admin"
+    try:
+        user = getattr(g, 'user', None)
+        return bool(user) and user["role"] == "admin"
+    except (KeyError, IndexError, TypeError):
+        return False
 
 
 def get_incident_actions(incident_ids):
@@ -568,9 +647,13 @@ BASE = """<!doctype html>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('files') }}">Files</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('upload') }}">Upload</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('incidents') }}">Incidents</a>
-        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('maintenance_personnel') }}">Maintenance</a>
         {% if g.user.role == 'admin' %}
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('maintenance_personnel') }}">Maintenance</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('add_user') }}">Add User</a>
         <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('backups') }}">Backups</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('audit_logs') }}">Audit Logs</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('access_termination_log_view') }}">Access Log</a>
+        <a class="btn btn-sm btn-outline-light me-2" href="{{ url_for('users_view') }}">Users</a>
         {% endif %}
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('logout') }}">Logout</a>
       {% else %}
@@ -793,10 +876,7 @@ def record_failed_login(conn, user_row):
     ))
     conn.commit()
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "GET":
-        body = """
+LOGIN_FORM = """
         <div class="row justify-content-center">
           <div class="col-md-6">
             <div class="card shadow-sm">
@@ -819,21 +899,30 @@ def login():
           </div>
         </div>
         """
-        return page("Login", body)
 
-        conn = db_connect()
-        row = conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username=?",
-            (username,)
-        ).fetchone()
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return page("Login", LOGIN_FORM)
+
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT id, username, password_hash, failed_login_count, last_failed_login, locked_until FROM users WHERE username=?",
+        (username,)
+    ).fetchone()
+
+    if not row:
         conn.close()
         flash("Invalid username or password.")
-        return render_template("login.html")
+        return page("Login", LOGIN_FORM)
 
     if is_account_locked(row):
         conn.close()
         flash("Account is temporarily locked due to repeated failed login attempts. Please try again later.")
-        return render_template("login.html")
+        return page("Login", LOGIN_FORM)
 
     try:
         ph.verify(row["password_hash"], password)
@@ -842,29 +931,27 @@ def login():
         conn.close()
         log_event(row["id"], username, "LOGIN", status="FAIL")
         flash("Invalid username or password.")
-        return render_template("login.html")
+        return page("Login", LOGIN_FORM)
 
-        session["user_id"] = row["id"]
-        session['session_id'] = str(uuid.uuid4())
-        active_sessions[session['session_id']] = {
-            'user_id': row["id"],
-            'username': row["username"],
-            'login_time': datetime.datetime.utcnow(),
-            'last_activity': datetime.datetime.utcnow(),
-            'ip': request.remote_addr
-        }
-        flash("Logged in successfully.")
-        if not session.get("seen_onboarding"):
-              return redirect(url_for("onboarding"))
-        return redirect(url_for("files"))
+    clear_lockout_state(conn, row["id"])
+    conn.close()
 
     session.permanent = True
     session["user_id"] = row["id"]
+    session["session_id"] = str(uuid.uuid4())
+    active_sessions[session["session_id"]] = {
+        "user_id": row["id"],
+        "username": row["username"],
+        "login_time": datetime.utcnow(),
+        "last_activity": datetime.utcnow(),
+        "ip": request.remote_addr,
+    }
+
+    log_event(row["id"], username, "LOGIN", status="SUCCESS")
     flash("Logged in successfully.")
 
     if not session.get("seen_onboarding"):
         return redirect(url_for("onboarding"))
-
     return redirect(url_for("files"))
 
 
@@ -956,7 +1043,7 @@ def signup():
         password_hash = ph.hash(password)
         conn.execute(
             "INSERT INTO users(username, password_hash, role, created_at) VALUES (?,?,?,?)",
-            (username, password_hash, "user", datetime.datetime.utcnow().isoformat())
+            (username, password_hash, "user", datetime.utcnow().isoformat())
         )
         conn.commit()
         conn.close()
@@ -966,6 +1053,12 @@ def signup():
 
     return page("Sign Up", render_template_string(SIGNUP_FORM, **form_data))
 
+@app.route("/inbox")
+@login_required
+def inbox():
+    return render_template("inbox.html", messages=[])
+
+
 @app.route("/logout")
 def logout():
     if 'session_id' in session:
@@ -974,30 +1067,172 @@ def logout():
     flash("Logged out.")
     return redirect(url_for("home"))
 
-@app.route("/active-sessions")
+@app.route("/users")
 @login_required
-def active_sessions_view():
+def users_view():
     if not is_admin():
         abort(403)
-    now = datetime.datetime.utcnow()
-    # Consider active if last activity within 30 seconds
-    active = {k: v for k, v in active_sessions.items() if (now - v['last_activity']).total_seconds() < 30}
-    return render_template('active_sessions.html', sessions=list(active.values()), now=now)
+    now = datetime.utcnow()
+    q = (request.args.get('q') or '').strip()
+    conn = db_connect()
+    if q:
+        db_users = conn.execute(
+            "SELECT id, username, role, created_at, status FROM users WHERE username LIKE ? ORDER BY username",
+            (f'%{q}%',)
+        ).fetchall()
+    else:
+        db_users = conn.execute(
+            "SELECT id, username, role, created_at, status FROM users ORDER BY username"
+        ).fetchall()
+    maintenance_ids = {
+        row['user_id'] for row in conn.execute(
+            "SELECT user_id FROM maintenance_personnel WHERE status='active'"
+        ).fetchall()
+    }
+    conn.close()
+
+    online_ids = {v['user_id'] for v in active_sessions.values()
+                  if (now - v['last_activity']).total_seconds() < 120}
+
+    users_data = sorted(
+        [dict(u) | {'online': u['id'] in online_ids, 'is_maintenance': u['id'] in maintenance_ids}
+         for u in db_users],
+        key=lambda u: (0 if u['online'] else 1, u['username'])
+    )
+    return render_template('users.html', users=users_data, now=now, q=q)
+
+
+def _log_termination(conn, target_id, target_username, action, personnel_action, reason, performed_by):
+    conn.execute(
+        """INSERT INTO access_termination_log
+           (target_user_id, target_username, action, personnel_action, reason, performed_by_id, performed_by_username, performed_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (target_id, target_username, action, personnel_action, reason,
+         performed_by['id'], performed_by['username'], datetime.utcnow().isoformat())
+    )
+
+
+@app.route("/users/<int:user_id>/disable", methods=["POST"])
+@login_required
+def disable_user(user_id):
+    if not is_admin():
+        abort(403)
+    if user_id == session.get('user_id'):
+        flash("You cannot disable your own account.")
+        return redirect(url_for("users_view"))
+    reason = (request.form.get("reason") or "").strip()
+    personnel_action = (request.form.get("personnel_action") or "").strip()
+    if not reason:
+        flash("A reason is required to disable an account.")
+        return redirect(url_for("users_view"))
+    conn = db_connect()
+    target = conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        abort(404)
+    conn.execute("UPDATE users SET status='disabled' WHERE id=?", (user_id,))
+    _log_termination(conn, user_id, target['username'], 'disabled', personnel_action or None, reason, g.user)
+    conn.commit()
+    conn.close()
+    to_kill = [sid for sid, v in active_sessions.items() if v['user_id'] == user_id]
+    for sid in to_kill:
+        terminated_sessions.add(sid)
+        active_sessions.pop(sid, None)
+    log_event(g.user["id"], g.user["username"], "ACCOUNT_DISABLED", target=target['username'], metadata={"reason": reason, "personnel_action": personnel_action})
+    flash(f"Account for {target['username']} disabled.")
+    return redirect(url_for("users_view"))
+
+
+@app.route("/users/<int:user_id>/enable", methods=["POST"])
+@login_required
+def enable_user(user_id):
+    if not is_admin():
+        abort(403)
+    reason = (request.form.get("reason") or "").strip() or "Access restored by admin"
+    conn = db_connect()
+    target = conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        abort(404)
+    conn.execute("UPDATE users SET status='active' WHERE id=?", (user_id,))
+    _log_termination(conn, user_id, target['username'], 'enabled', None, reason, g.user)
+    conn.commit()
+    conn.close()
+    log_event(g.user["id"], g.user["username"], "ACCOUNT_ENABLED", target=target['username'], metadata={"reason": reason})
+    flash(f"Account for {target['username']} enabled.")
+    return redirect(url_for("users_view"))
+
+
+@app.route("/users/<int:user_id>/transfer", methods=["POST"])
+@login_required
+def transfer_user(user_id):
+    if not is_admin():
+        abort(403)
+    reason = (request.form.get("reason") or "").strip()
+    if not reason:
+        flash("A reason is required to initiate a transfer.")
+        return redirect(url_for("users_view"))
+    conn = db_connect()
+    target = conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        abort(404)
+    conn.execute("UPDATE users SET status='transfer_review' WHERE id=?", (user_id,))
+    conn.execute(
+        "UPDATE maintenance_personnel SET status='revoked', revoked_by=?, revoked_at=?, revoke_reason=? WHERE user_id=? AND status='active'",
+        (g.user['id'], datetime.utcnow().isoformat(), f"Auto-revoked: personnel transfer — {reason}", user_id)
+    )
+    _log_termination(conn, user_id, target['username'], 'transferred', 'personnel_transfer', reason, g.user)
+    conn.commit()
+    conn.close()
+    to_pause = [sid for sid, v in active_sessions.items() if v['user_id'] == user_id]
+    for sid in to_pause:
+        paused_sessions.add(sid)
+    log_event(g.user["id"], g.user["username"], "ACCOUNT_TRANSFER", target=target['username'], metadata={"reason": reason})
+    flash(f"Transfer initiated for {target['username']}. Account is under review.")
+    return redirect(url_for("users_view"))
+
+
+@app.route("/access-termination-log")
+@login_required
+def access_termination_log_view():
+    if not is_admin():
+        abort(403)
+    conn = db_connect()
+    logs = conn.execute("""
+        SELECT id, target_username, action, personnel_action, reason,
+               performed_by_username, performed_at
+        FROM access_termination_log
+        ORDER BY performed_at DESC
+        LIMIT 500
+    """).fetchall()
+    conn.close()
+    return render_template('access_termination_log.html', logs=logs)
 
 @app.route("/audit-logs")
 @login_required
 def audit_logs():
     if not is_admin():
         abort(403)
+    q = (request.args.get('q') or '').strip()
     conn = db_connect()
-    logs = conn.execute("""
-        SELECT timestamp, username, action, target, status, metadata
-        FROM audit_log
-        ORDER BY timestamp DESC
-        LIMIT 1000
-    """).fetchall()
+    if q:
+        logs = conn.execute("""
+            SELECT timestamp, username, action, target, status, metadata
+            FROM audit_logs
+            WHERE username LIKE ?
+            ORDER BY timestamp DESC
+            LIMIT 1000
+        """, (f'%{q}%',)).fetchall()
+    else:
+        logs = conn.execute("""
+            SELECT timestamp, username, action, target, status, metadata
+            FROM audit_logs
+            ORDER BY timestamp DESC
+            LIMIT 1000
+        """).fetchall()
     conn.close()
-    return render_template('audit_logs.html', logs=logs)
+    return render_template('audit_logs.html', logs=logs, q=q)
 
 @app.route("/add-user", methods=["GET", "POST"])
 def add_user():
@@ -1027,7 +1262,7 @@ def add_user():
         try:
             conn.execute(
                 "INSERT INTO users(username, password_hash, role, created_at) VALUES (?,?,?,?)",
-                (username, pw_hash, role, datetime.datetime.utcnow().isoformat())
+                (username, pw_hash, role, datetime.utcnow().isoformat())
             )
             conn.commit()
         except sqlite3.IntegrityError:
@@ -1036,6 +1271,7 @@ def add_user():
             return redirect(url_for("add_user"))
         conn.close()
 
+        log_event(g.user["id"] if g.user else 0, g.user["username"] if g.user else "system", "USER_CREATED", target=username, metadata={"role": role})
         flash("User created.")
         return redirect(url_for("login"))
 
@@ -1121,6 +1357,7 @@ def upload():
         conn.commit()
         conn.close()
 
+        log_event(g.user["id"], g.user["username"], "FILE_UPLOAD", target=orig_name, metadata={"size": len(file_bytes), "mime": mime})
         flash("Uploaded successfully.")
         return redirect(url_for("files"))
 
@@ -1784,6 +2021,7 @@ def download(file_id: int):
 
     session.pop(f"shared_download_ok_{file_id}", None)
 
+    log_event(g.user["id"], g.user["username"], "FILE_DOWNLOAD", target=orig_name)
     return send_file(
         io.BytesIO(data),
         as_attachment=True,
@@ -1819,6 +2057,7 @@ def delete(file_id: int):
     conn.commit()
     conn.close()
 
+    log_event(g.user["id"], g.user["username"], "FILE_DELETE", target=row["orig_name"] or stored_name)
     flash("Deleted.")
     return redirect(url_for("files"))
 
@@ -1941,19 +2180,35 @@ def maintenance_personnel():
     if not is_admin():
         abort(403)
 
+    q = (request.args.get('q') or '').strip()
     conn = db_connect()
-    records = conn.execute("""
-        SELECT mp.id, mp.approved_at, mp.reason, mp.status,
-               mp.revoked_at, mp.revoke_reason,
-               u.username AS personnel_name,
-               approver.username AS approver_name,
-               revoker.username AS revoker_name
-        FROM maintenance_personnel mp
-        JOIN users u ON u.id = mp.user_id
-        JOIN users approver ON approver.id = mp.approved_by
-        LEFT JOIN users revoker ON revoker.id = mp.revoked_by
-        ORDER BY mp.approved_at DESC
-    """).fetchall()
+    if q:
+        records = conn.execute("""
+            SELECT mp.id, mp.approved_at, mp.reason, mp.status,
+                   mp.revoked_at, mp.revoke_reason,
+                   u.username AS personnel_name,
+                   approver.username AS approver_name,
+                   revoker.username AS revoker_name
+            FROM maintenance_personnel mp
+            JOIN users u ON u.id = mp.user_id
+            JOIN users approver ON approver.id = mp.approved_by
+            LEFT JOIN users revoker ON revoker.id = mp.revoked_by
+            WHERE u.username LIKE ?
+            ORDER BY mp.approved_at DESC
+        """, (f'%{q}%',)).fetchall()
+    else:
+        records = conn.execute("""
+            SELECT mp.id, mp.approved_at, mp.reason, mp.status,
+                   mp.revoked_at, mp.revoke_reason,
+                   u.username AS personnel_name,
+                   approver.username AS approver_name,
+                   revoker.username AS revoker_name
+            FROM maintenance_personnel mp
+            JOIN users u ON u.id = mp.user_id
+            JOIN users approver ON approver.id = mp.approved_by
+            LEFT JOIN users revoker ON revoker.id = mp.revoked_by
+            ORDER BY mp.approved_at DESC
+        """).fetchall()
 
     all_users = conn.execute(
         "SELECT id, username FROM users ORDER BY username"
@@ -1973,6 +2228,12 @@ def maintenance_personnel():
         Authorize Personnel
       </button>
     </div>
+
+    <form method="get" class="mb-3 d-flex gap-2" style="max-width:400px;">
+      <input class="form-control" type="text" name="q" value="{{ q }}" placeholder="Search by username…">
+      <button class="btn btn-outline-secondary" type="submit">Search</button>
+      {% if q %}<a class="btn btn-outline-danger" href="{{ url_for('maintenance_personnel') }}">Clear</a>{% endif %}
+    </form>
 
     <!-- Authorization modal -->
     <div class="modal fade" id="authorizeModal" tabindex="-1">
@@ -2094,7 +2355,7 @@ def maintenance_personnel():
       No maintenance personnel have been authorized yet. Use the button above to authorize a vetted user.
     </div>
     {% endif %}
-    """, records=records, all_users=all_users)
+    """, records=records, all_users=all_users, q=q)
 
     return render_template_string(BASE, title="Maintenance Personnel", body=body, signup_enabled=SIGNUP_ENABLED)
 
@@ -2137,7 +2398,7 @@ def maintenance_personnel_authorize():
         flash(f"{target['username']} already has active maintenance authorization.")
         return redirect(url_for("maintenance_personnel"))
 
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
     cur = conn.execute(
         """INSERT INTO maintenance_personnel(user_id, approved_by, approved_at, reason, status)
            VALUES (?, ?, ?, ?, 'active')""",
@@ -2194,7 +2455,7 @@ def maintenance_personnel_revoke(record_id: int):
         flash("This authorization is already revoked.")
         return redirect(url_for("maintenance_personnel"))
 
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.utcnow().isoformat()
     conn.execute(
         """UPDATE maintenance_personnel
            SET status='revoked', revoked_by=?, revoked_at=?, revoke_reason=?

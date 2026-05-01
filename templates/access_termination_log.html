@@ -1,0 +1,61 @@
+{% extends 'base.html' %}
+
+{% block title %}Access Termination Log - Secure Uploader{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2>Access Termination Log</h2>
+    <p class="text-muted mb-0">Audit trail of all access terminations, transfers, and reinstatements tied to personnel actions.</p>
+  </div>
+</div>
+
+{% if logs %}
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-striped mb-0 align-middle">
+      <thead class="table-light">
+        <tr>
+          <th>When</th>
+          <th>User Affected</th>
+          <th>Action</th>
+          <th>Personnel Action</th>
+          <th>Reason</th>
+          <th>Performed By</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for log in logs %}
+        <tr>
+          <td><small>{{ log.performed_at[:19].replace('T', ' ') }}</small></td>
+          <td><strong>{{ log.target_username }}</strong></td>
+          <td>
+            {% if log.action == 'disabled' %}
+              <span class="badge bg-danger">Disabled</span>
+            {% elif log.action == 'enabled' %}
+              <span class="badge bg-success">Enabled</span>
+            {% elif log.action == 'transferred' %}
+              <span class="badge bg-warning text-dark">Transfer Initiated</span>
+            {% else %}
+              <span class="badge bg-secondary">{{ log.action }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if log.personnel_action %}
+              <span class="badge bg-light text-dark border">{{ log.personnel_action.replace('_', ' ').title() }}</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td>{{ log.reason }}</td>
+          <td><small>{{ log.performed_by_username }}</small></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+  <div class="alert alert-info">No access termination events recorded yet.</div>
+{% endif %}
+{% endblock %}
