@@ -1,0 +1,161 @@
+
+============================================================
+0. BASELINE SCOPE AND EVIDENCE SOURCES
+============================================================
+[PASS] BASELINE               Scope      Application directory detected: /home/mohammed/secure_uploader
+[PASS] BASELINE               File       main.py exists
+[PASS] BASELINE               File       crypto_utils.py exists
+[WARN] BASELINE               Config     .env not found in app dir; may be configured via systemd/Azure
+[PASS] BASELINE               Service    systemd unit exists: /etc/systemd/system/secureuploader.service
+[PASS] BASELINE               Runtime    secureuploader.service is active
+[PASS] BASELINE               Syntax     main.py passes python syntax check
+
+============================================================
+1. ACCESS CONTROL (AC) OBJECTIVE CHECKS
+============================================================
+[PASS] AC.L2-3.1.1            a,d        Authorized users are identified and protected routes require login/session
+[PASS] AC.L2-3.1.1            c,f        File/device/resource authorization logic appears present using owner/share/access fields
+[PASS] AC.L2-3.1.2            a,b        User roles/functions are defined and access appears role-restricted
+[PASS] AC.L2-3.1.3            a-e        CUI/file flow is controlled through upload/download/share/delete routes and access checks
+[PASS] AC.L2-3.1.4            a-c        Separation of admin and standard user duties appears implemented
+[PASS] AC.L2-3.1.5            a-d        Least privilege evidence found through admin/owner/share restrictions
+[PASS] AC.L2-3.1.6            a,b        Non-security/standard user role separation appears present
+[PASS] AC.L2-3.1.7            a-d        Privileged functions appear blocked for non-privileged users and loggable
+[PASS] AC.L2-3.1.8            a,b        Failed login limitation/rate limiting evidence found
+[PASS] AC.L2-3.1.9            a,b        Privacy/security notice or onboarding banner evidence appears present
+[PASS] AC.L2-3.1.10           a-c        Session inactivity lock/timeout configuration appears present
+[PASS] AC.L2-3.1.11           a,b        Session termination condition and logout/session clear evidence found
+[PASS] AC.L2-3.1.12           a-d        Remote access/session activity appears monitored through IP/user audit logging
+[PASS] AC.L2-3.1.14           a,b        Remote/app access routed through managed reverse proxy to localhost backend
+[PASS] AC.L2-3.1.15           a-d        Privileged remote admin/security access appears role-restricted
+[WARN] AC.L2-3.1.16-19        All        No wireless/mobile app evidence; document N/A or inherited/not used in SSP
+[PASS] AC.L2-3.1.20           a-f        External/cloud service use appears identified through Azure Blob/Key Vault configuration
+[WARN] AC.L2-3.1.22           a,b        Public information control needs manual content review and approval evidence
+
+============================================================
+2. IDENTIFICATION AND AUTHENTICATION (IA) OBJECTIVE CHECKS
+============================================================
+[PASS] IA.L2-3.5.1            a-d        Users are uniquely identified by username/user_id/OIDC identifiers
+[PASS] IA.L2-3.5.2            a,b        Authentication mechanism/password verification/OIDC evidence found
+[PASS] IA.L2-3.5.3            a-d        MFA/OIDC/Entra or TOTP evidence appears present
+[PASS] IA.L2-3.5.4            a,b        Replay-resistant token/state/CSRF/SameSite evidence found
+[WARN] IA.L2-3.5.8            a,b        Password reuse prevention not found; document if handled by Entra or not implemented
+[WARN] IA.L2-3.5.9            a-c        Temporary password handling not found; document as N/A if no temp passwords used
+[PASS] IA.L2-3.5.10           a,b        Passwords appear cryptographically protected using hashing
+[PASS] IA.L2-3.5.11           a,b        Password input/obscuring evidence appears present in templates or inline HTML
+
+============================================================
+3. AUDIT AND ACCOUNTABILITY (AU) OBJECTIVE CHECKS
+============================================================
+[PASS] AU.L2-3.3.1            a-d        Audit record generation logic found
+[PASS] AU.L2-3.3.2            a,b        Audit records appear linked to user/time/IP
+[PASS] AU.L2-3.3.3            a,b        Admin audit log review functionality appears present
+[WARN] AU.L2-3.3.4            a,b        Audit failure handling/alerting may need manual validation
+[PASS] AU.L2-3.3.5            a,b        Audit fields support correlation by user/IP/file/event
+[PASS] AU.L2-3.3.6            a,b        Audit review/reporting functionality appears present
+[PASS] AU.L2-3.3.7            a,b        System time synchronization is active
+[PASS] AU.L2-3.3.8            a,b        Audit DB located at /srv/secure_uploader_data/files.db; check file permissions below
+[PASS] AU.L2-3.3.9            a,b        Audit management/review appears restricted to admin
+
+============================================================
+4. CONFIGURATION MANAGEMENT (CM) OBJECTIVE CHECKS
+============================================================
+[PASS] CM.L2-3.4.1            a-c        Git repository provides configuration baseline/history
+[PASS] CM.L2-3.4.1            a-c        Dependency baseline file exists
+[PASS] CM.L2-3.4.6            a,b        .gitignore excludes secrets/local DB/venv/uploads
+[PASS] CM.L2-3.4.3            a-e        Recent git change history available
+[PASS] CM.L2-3.4.7            a,b        No obvious dangerous user-facing execution functions found
+[PASS] CM.L2-3.4.8            a,b        Upload constraints/application behavior controls appear present
+[WARN] CM.L2-3.4.9            a,b        Need policy/OS evidence restricting user-installed software
+
+============================================================
+5. CRYPTOGRAPHY, STORAGE, AND COMMUNICATION PROTECTION (SC)
+============================================================
+[PASS] SC.L2-3.13.16          a,b        Data-at-rest encryption implementation appears present
+[PASS] SC.L2-3.13.10          a-c        Key management evidence found through Key Vault/env key handling
+[PASS] SC.L2-3.13.11          a,b        Cryptographic mechanism evidence appears present
+[PASS] SC.L2-3.13.8           a,b        Nginx TLS/HTTPS reverse proxy evidence found
+[PASS] SC.L2-3.13.1           a,b        Backend bound to localhost behind boundary/reverse proxy
+[PASS] SC.L2-3.13.6           a,b        UFW firewall active
+[WARN] SC.L2-3.13.12          a,b        If no collaboration devices are used, document as N/A in SSP
+[WARN] SC.L2-3.13.13          a,b        Mobile code requires policy/config evidence
+[WARN] SC.L2-3.13.14          a,b        Need N/A statement if VoIP not in scope
+[PASS] SC.L2-3.13.15          a,b        Communication authenticity/token evidence appears present
+
+============================================================
+6. DATABASE SCHEMA OBJECTIVE EVIDENCE
+============================================================
+[PASS] DB                     Source     SQLite database exists: /srv/secure_uploader_data/files.db
+Database tables:
+audit_log      file_access    file_messages  files          users        
+[PASS] IA/AC                  Schema     users table exists
+[PASS] IA.L2-3.5.1            a          users table contains unique identifier field
+[PASS] IA.L2-3.5.10           a          users table stores password hash, not plaintext
+[PASS] AC.L2-3.1.2            a,b        users table contains role/admin field
+[WARN] AC.L2-3.1.8            a,b        failed login/lockout DB fields not found; maybe limiter-only
+[PASS] AC.L2-3.1.1            a,d        files table contains ownership field
+[PASS] AC.L2-3.1.2            b          file_access table supports shared authorization
+[PASS] AU.L2-3.3.1            a-d        audit log table exists
+[WARN] MP.L2-3.8.9            a,b        backup_records table not found
+
+============================================================
+7. MEDIA PROTECTION, BACKUP, MAINTENANCE, INCIDENT RESPONSE, RISK
+============================================================
+[PASS] MP.L2-3.8.9            a-c        Backup/storage functionality appears present
+[PASS] MP.L2-3.8.3            a,b        Media/file disposal/delete logic appears present
+[WARN] MP.L2-3.8.7            a,b        Document removable media as not used/N/A if true
+[PASS] IR.L2-3.6.1            a-c        Incident handling/reporting workflow appears present
+[PASS] IR.L2-3.6.2            a,b        Incident reporting evidence appears present
+[WARN] IR.L2-3.6.3            a,b        Incident response testing requires tabletop/test record
+[WARN] MA.L2-3.7.1            a-d        Need maintenance log/procedure evidence
+[WARN] MA.L2-3.7.5            a-d        Remote maintenance MFA requires SSH/Entra evidence
+[WARN] RA.L2-3.11.1-3         All        Need vulnerability scan and remediation records
+[WARN] PS.L2-3.9.1-2          All        Personnel security is mostly policy/admin process evidence
+[WARN] PE.L2-3.10.1-6         All        Document physical protection as Azure inherited/shared responsibility
+
+============================================================
+8. SECURITY ASSESSMENT (CA), AWARENESS/TRAINING (AT), AND SSP
+============================================================
+[PASS] CA.L2-3.12.4           a,b        System Security Plan file found
+[WARN] CA.L2-3.12.4           a,b        Security policy file not found; attach policy document
+[PASS] CA.L2-3.12.1           a,b        This script executed a technical security-control assessment and generated findings
+[WARN] CA.L2-3.12.2           a,b        POA&M/operational plan not found; add if any gaps remain
+[PASS] AT.L2-3.2.1-3          All        Training/awareness evidence appears present in app/code
+
+============================================================
+9. LIVE RUNTIME SMOKE TESTS
+============================================================
+[PASS] Runtime                Network    App backend listening on 127.0.0.1:8000
+[PASS] SC.L2-3.13.8           Test       HTTPS endpoint responds locally
+HTTP/1.1 302 FOUND
+Server: nginx/1.18.0 (Ubuntu)
+Date: Fri, 01 May 2026 04:24:44 GMT
+Content-Type: text/html; charset=utf-8
+Content-Length: 209
+Connection: keep-alive
+Location: /onboarding
+Vary: Cookie
+[PASS] Runtime                Backend    Backend responds on localhost
+[PASS] AC.L2-3.1.8            SSH        Fail2Ban sshd jail active
+[WARN] AC.L2-3.1.12           SSH        SSH password authentication setting not confirmed
+
+============================================================
+10. OBJECTIVE-LEVEL MANUAL EVIDENCE REMINDERS
+============================================================
+[INFO] MANUAL                 Guide      For every WARN, attach screenshot/policy/interview note before final submission
+[INFO] MANUAL                 Findings   Mark MET only when all applicable objectives are satisfied; otherwise NOT MET or N/A with reason
+[INFO] MANUAL                 N/A        Wireless/mobile/VoIP/physical/personnel controls may be N/A or inherited only if documented in SSP
+
+============================================================
+11. SUMMARY
+============================================================
+PASS: 68
+WARN: 22
+FAIL: 0
+INFO: 3
+
+Markdown report: securevault_cmmc_audit_report_2026-05-01T04-24-43Z.md
+Raw output file: securevault_cmmc_audit_raw_2026-05-01T04-24-43Z.txt
+
+Recommended command for demo/submission:
+  ./securevault_cmmc_objective_audit.sh | tee final_terminal_evidence.txt
