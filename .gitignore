@@ -33,6 +33,7 @@ dist/
 .vs/
 .vscode/
 .idea/
+.claude/
 
 # Logs
 *.log
@@ -49,3 +50,5 @@ files.db
 __pycache__/
 files.db
 *.bak.*
+audit_log.ndjson
+maintenance_personnel.json

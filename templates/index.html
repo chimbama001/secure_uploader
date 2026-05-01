@@ -10,6 +10,11 @@
       <a class="btn btn-primary" href="{{ url_for('upload') }}">Upload</a>
       <a class="btn btn-outline-primary" href="{{ url_for('files') }}">View Files</a>
       <a class="btn btn-outline-secondary" href="{{ url_for('add_user_form') }}">Add User</a>
+      {% if is_admin() %}
+      <a class="btn btn-outline-info" href="{{ url_for('active_sessions_view') }}">Active Sessions</a>
+      <a class="btn btn-outline-secondary" href="{{ url_for('audit_logs') }}">Audit Logs</a>
+      <a class="btn btn-outline-warning" href="{{ url_for('backups') }}">Backups</a>
+      {% endif %}
     </div>
   </div>
 {% endblock %}

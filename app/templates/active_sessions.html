@@ -1,0 +1,48 @@
+{% extends 'base.html' %}
+
+{% block title %}Active Sessions - Secure Uploader{% endblock %}
+
+{% block content %}
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2>Active Sessions</h2>
+  </div>
+  {% if sessions %}
+    <div class="card">
+      <div class="table-responsive">
+        <table class="table table-striped mb-0 card-table">
+          <thead class="table-light">
+            <tr>
+              <th>Session ID</th>
+              <th>User</th>
+              <th>IP Address</th>
+              <th>Created</th>
+              <th>Last Seen</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for s in sessions %}
+              <tr>
+                <td>{{ s.session_id }}</td>
+                <td>{{ s.username }}</td>
+                <td>{{ s.ip_address or '-' }}</td>
+                <td>{{ s.created_at }}</td>
+                <td>{{ s.last_seen }}</td>
+                <td>
+                  {% set age = (now - s.last_seen_dt).total_seconds() %}
+                  {% if age < (SESSION_IDLE_MINUTES * 60) %}
+                    <span class="badge bg-success">Active</span>
+                  {% else %}
+                    <span class="badge bg-secondary">Expired</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% else %}
+    <div class="alert alert-info">No active sessions available.</div>
+  {% endif %}
+{% endblock %}
